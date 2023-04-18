@@ -1,0 +1,9 @@
+[user]
+	email = r083rt164@gmail.com
+	name = Robert Battaglia
+	username = RobertBattaglia
+[core]
+	autocrlf = false
+	editor = vim
+[commit]
+	gpgsign = true

@@ -1,0 +1,4 @@
+# append path
+path+=("$HOME/.local/bin")
+# prepend path path=('' $path)
+export PATH
