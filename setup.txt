@@ -1,0 +1,5 @@
+
+install patched font from nerd-fonts.
+Copy font files into /Library/Fonts on macOS or ~/.local/share/fonts on linux
+	(copy to linux dir and run command to symlink everything to mac dir) use the script in bin
+	go to preferences in terminal to change font to one just downloaded.

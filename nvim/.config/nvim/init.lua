@@ -1,2 +1,2 @@
-require("remaps")
-require("plugins")
+require('plugins')
+require('remaps')
