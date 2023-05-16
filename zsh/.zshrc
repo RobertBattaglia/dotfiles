@@ -95,7 +95,8 @@ source $ZSH/oh-my-zsh.sh
 # plugins, and themes. Aliases can be placed here, though oh-my-zsh
 # users are encouraged to define aliases within the ZSH_CUSTOM folder.
 # For a full list of active aliases, run `alias`.
-#
+alias opengit="open -a \"Google Chrome\" \"https://\$(git remote -v | head -1 | tr \"@\" \"\n\" | tail -1 | awk '{ print \$1 }' | tr \":\" \"/\")\""
+
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
