@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+lpass show -G 'openai api key' | awk 'END { print $2 }'
