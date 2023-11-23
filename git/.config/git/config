@@ -1,0 +1,13 @@
+[user]
+	user = Robert Battaglia
+	email = r083rt164@gmail.com
+	name = Robert Battaglia
+	signingkey = 613BED3B035FB1AD0CB1A1063C50DE7686FB9E60
+[commit]
+	gpgsign = true
+[core]
+	autocrlf = input
+	excludesfile = ~/git/.gitignore_global
+	editer = nvim
+[help]
+	autocorrect = 20
