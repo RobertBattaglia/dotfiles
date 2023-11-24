@@ -7,7 +7,7 @@
 	gpgsign = true
 [core]
 	autocrlf = input
-	excludesfile = ~/git/.gitignore_global
+	excludesfile = ~/.config/git/ignore
 	editer = nvim
 [help]
 	autocorrect = 20
