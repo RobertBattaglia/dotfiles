@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+pass=$(lpass show -G LDAP | grep Password | head -1 | awk '{ print $2 }')
+
+echo "$pass" | pbcopy
+echo "$pass"
