@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import sys
+import subprocess
+import time
+
+
+class PathNode():
+    def __init__(self, path, exclude):
+        self.path = path
+        self.exclude = exclude
+        self.excluded = self.should_exclude()
+        if not self.excluded:
+            self.children = self.find_children()
+            self.contributions = self.compute_contributions()
+
+    def should_exclude(self):
+        path = self.path[2:] if self.path.startswith('./') else self.path
+        if path in self.exclude:
+            return True
+        check_ignore_process = subprocess.run(
+            ['git', 'check-ignore', '-q', path]
+        )
+        return check_ignore_process.returncode == 0
+
+    def stringify(self, depth=0):
+        s = '\n'
+        indent = ('|    ' * (depth - 1)) + '|----' if depth > 0 else ''
+        s += f'{indent} {self.path}'
+        s += f'\n{self.repr_contributions(depth)}'
+        for child in self.children:
+            s += '\n'
+            s += child.stringify(depth + 1)
+
+        return s
+
+    def repr_contributions(self, depth=0):
+        indent = ' ' * 5 * depth
+        return '\n'.join(list(map(
+            lambda x: f' {indent}{x.get("author")}: {x.get("count")}',
+            self.contributions
+        )))
+
+    def find_children(self):
+        command = ['find', self.path, '-maxdepth', '1']
+        process = subprocess.run(command, capture_output=True, text=True)
+        data = process.stdout.split('\n')[:-1]
+
+        children = []
+        for i in range(1, len(data)):
+            path = data[i]
+
+            try:
+                child_path_node = PathNode(path, self.exclude)
+                if not child_path_node.excluded:
+                    children.append(child_path_node)
+
+            except UnicodeDecodeError:
+                sys.stderr.write(f'Error processing {path}\n')
+
+        return children
+
+    def compute_contributions(self):
+        if (not self.is_file()):
+            return self.merge_child_contributions()
+
+        data = subprocess.run(
+            f"git blame --line-porcelain {self.path} | " +
+            "sed -n 's/^author //p' | " +
+            "tr ' ' '_' | " +
+            "sort | " +
+            "uniq -c | " +
+            "sort -rn",
+            shell=True,
+            capture_output=True,
+            text=True
+        ).stdout
+
+        lines = filter(lambda x: len(x) > 0, data.split('\n'))
+        data = [{
+                'author': line.split()[1].replace('_', ' '),
+                'count': int(line.split()[0])}
+                for line in lines]
+
+        return data
+
+    def merge_child_contributions(self):
+        merged_contributions = collections.defaultdict(int)
+        for child in self.children:
+            for contribution in child.contributions:
+                author = contribution.get('author')
+                count = contribution.get('count')
+                merged_contributions[author] += count
+
+        unsorted_contributions = [
+            {'author': k, 'count': v} for k, v in merged_contributions.items()
+        ]
+        return sorted(
+            unsorted_contributions,
+            key=lambda x: x['count'],
+            reverse=True
+        )
+
+    def is_file(self):
+        return len(self.children) == 0
+
+
+parser = argparse.ArgumentParser(
+    description='Count code contributions by lines per author in a git repo',
+    usage='contributizer src --exclude dir1 dir2/nested2'
+)
+parser.add_argument('dir', nargs='?', default='.')
+parser.add_argument('--exclude', nargs='*')
+args = parser.parse_args()
+
+exclude = set(args.exclude) if args.exclude else set()
+exclude.add('.git')
+if args.dir in exclude:
+    sys.stderr.write(f'Error: {args.dir} specified in --exclude list\n')
+    sys.exit(1)
+
+start = time.time()
+root = PathNode(args.dir, exclude)
+
+filename = 'contributizer.txt'
+with open(filename, 'w') as f:
+    f.write(root.stringify())
+print(f'{filename} generated in {round(time.time() - start, 2)} seconds')
