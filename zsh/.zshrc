@@ -76,6 +76,8 @@ source $ZSH/oh-my-zsh.sh
 
 # User configuration
 
+export MAX_KEPT=1 # for indeed RAD artifacts
+
 # export MANPATH="/usr/local/man:$MANPATH"
 
 # You may need to manually set your language environment
