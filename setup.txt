@@ -1,3 +1,7 @@
+install stow
+install tmux
+install neovim
+install fzf
 
 install patched font from nerd-fonts.
 Copy font files into /Library/Fonts on macOS or ~/.local/share/fonts on linux
