@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+ticket_prefix=""
+ticket=$(git branch | grep -Eo [A-Z]+\-[0-9]+)
+
+if [ "${#ticket}" -gt 0 ]; then
+	ticket_prefix=$(echo $ticket)$(echo ": ")
+fi
+
+model="claude-3.5-sonnet"
+prompt="write a commit message for this diff.
+Imagine you are a developer 5 years in the future searching through commit messages to explain why some peice of code is the way it is
+Capture the most important 1 or 2 changes.
+Unless it is the only change, ignore the following:
+1) Code Style and Formatting
+2) renaming variables
+3) Fixing typos
+Do not explain the reasoning just output the actual commit message"
+
+cody_response=$(git diff --cached | cody chat --stdin --model "$model" -m "$prompt")
+AI_COMMIT_MSG=$ticket_prefix$cody_response
+
+echo -e "\033[1m$AI_COMMIT_MSG\033[0m"
+echo "Do you want to create a commit with this message?"
+select yn in "Yes" "No"; do
+    case $yn in
+        Yes ) git commit -m "$AI_COMMIT_MSG"; break;;
+        No ) exit;;
+    esac
+done
+

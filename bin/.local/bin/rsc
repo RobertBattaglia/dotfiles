@@ -1,0 +1,42 @@
+#!/bin/bash
+ 
+# Handle Flags
+r_flag=''
+while getopts 'r' flag;
+do
+    case "${flag}" in
+        r) r_flag='true' ;;
+    esac
+done
+ 
+if [[ $PWD == "$HOME/.ssh" ]];
+then
+    echo "DANGER: don't rsync inside ssh directory"
+    exit 1
+fi
+ 
+ 
+tmp_include_file='/var/tmp/rs_include_tmp.txt'
+if [ -f $tmp_include_file ];
+then
+    rm -rf $tmp_include_file
+fi
+echo ".run\n.idea\n.gradle" >> $tmp_include_file
+ 
+tmp_exclude_file='/var/tmp/rs_exclude_tmp.txt'
+if [ -f $tmp_exclude_file ];
+then
+    rm -rf $tmp_exclude_file
+fi
+git ls-files --exclude-standard -oi --directory >> $tmp_exclude_file
+echo ".git" >> $tmp_exclude_file
+ 
+cvm=rbattaglia@rbattaglia.cvm.indeed.net:$(dirs)
+ 
+src=$([ "$r_flag" = 'true' ] && echo "$cvm" || echo "$PWD")
+dest=$([ "$r_flag" = 'true' ] && echo "$PWD" || echo "$cvm")
+ 
+(set -x; rsync -ahP --delete --include-from=$tmp_include_file --exclude-from=$tmp_exclude_file $src/ $dest)
+ 
+rm -rf $tmp_include_file
+rm -rf $tmp_exclude_file

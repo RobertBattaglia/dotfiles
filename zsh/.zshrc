@@ -77,6 +77,7 @@ source $ZSH/oh-my-zsh.sh
 # User configuration
 
 export MAX_KEPT=1 # for indeed RAD artifacts
+export GPG_TTY=$(tty)
 
 # export MANPATH="/usr/local/man:$MANPATH"
 
