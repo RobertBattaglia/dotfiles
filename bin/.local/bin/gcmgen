@@ -21,6 +21,8 @@ Unless it is the only change, ignore the following:
 1) Code Style and Formatting
 2) renaming variables
 3) Fixing typos
+Try to capture the highest level summary, don not hyper focus on any one or two changes, unless those are the only changes.
+Do not use semantic commit messages which prefix the commit message.
 Do not explain the reasoning just output the actual commit messages, separated by '---' without \n.
 This is cricial because the output is piped into another command"
 
@@ -79,6 +81,7 @@ done
 
 if [ ${#messages[@]} -eq 0 ]; then
     echo "No valid commit messages were generated. Please try again."
+    echo "Your diff might be too much context"
     exit 1
 fi
 

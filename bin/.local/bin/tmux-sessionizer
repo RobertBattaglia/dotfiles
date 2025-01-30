@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 
-session=$(find $HOME -mindepth 1 -maxdepth 3 -type d 2> /dev/null | fzf)
+ignore_patterns=(
+    "hobo_data"
+)
+
+ignore_regex=$(printf "|%s" "${ignore_patterns[@]}")
+ignore_regex=${ignore_regex:1}
+
+session=$(find $HOME -mindepth 1 -maxdepth 3 -type d 2> /dev/null | grep -Ev "$ignore_regex" | fzf)
 session_name=$(basename "$session" | tr . _)
 
 if ! tmux has-session -t "$session_name" 2> /dev/null ; then
