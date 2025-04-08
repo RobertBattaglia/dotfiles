@@ -13,27 +13,37 @@ if [ -n "$ticket" ]; then
     prefix="${ticket}: "
 fi
 
-model="claude-3.5-sonnet"
-prompt="write 5 different commit message for this diff, separated by '---' without \n.
+prompt="
+[INSTRUCTION]
+write 5 different commit message for this diff, separated by '---' without \n.
+
+[RULES]
 Imagine you are a developer 5 years in the future searching through commit messages to explain why some piece of code is the way it is
 Capture the most important 1 or 2 changes.
 Unless it is the only change, ignore the following:
 1) Code Style and Formatting
 2) renaming variables
 3) Fixing typos
-Try to capture the highest level summary, don not hyper focus on any one or two changes, unless those are the only changes.
+Try to capture the highest level summary, do not hyper focus on any one or two changes, unless those are the only changes.
 Do not use semantic commit messages which prefix the commit message.
+
+[FORMAT]
 Do not explain the reasoning just output the actual commit messages, separated by '---' without \n.
-This is cricial because the output is piped into another command"
+This is cricial because the output is piped into another command
+
+[EXAMPLE]
+<COMMIT MESSAGE 1>---<COMMIT MESSAGE 2>---<COMMIT MESSAGE 3>---<COMMIT MESSAGE 4>---<COMMIT MESSAGE 5>
+"
 
 temp_file=$(mktemp)
 echo "Generating commit messages... Please wait."
-git diff --cached | cody chat --stdin --model "$model" -m "$prompt" > "$temp_file" 2>/dev/null
-cody_response=$(<"$temp_file")
+git diff --cached | cody chat --stdin -m "$prompt" > "$temp_file" 2>/dev/null
+cody_response=$(cat "$temp_file" | tr '\n' ' ' | sed 's/^.*<\/think>//g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 rm "$temp_file"
 
 # Split the response into an array
 IFS='---' read -ra messages <<< "$cody_response"
+echo ${#messages[@]} messages found.
 
 # Function to display a message and get user choice
 display_message() {
