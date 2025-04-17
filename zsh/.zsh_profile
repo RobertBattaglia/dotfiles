@@ -2,3 +2,5 @@
 path+=("$HOME/.local/bin")
 # prepend path path=('' $path)
 export PATH
+
+export HOSTNAME=$(hostname)
