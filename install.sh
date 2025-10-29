@@ -14,6 +14,7 @@ elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
 else
     echo "Unsupported operating system"
     exit 1
+fi
 
 # Function to install packages based on OS
 install_package() {
@@ -30,8 +31,8 @@ install_package() {
             sudo ln -sf /opt/nvim-linux64/bin/nvim /usr/local/bin/nvim
             rm nvim-linux64.tar.gz
         else
-        sudo apt-get install -y $package_name
-    fi
+            sudo apt-get install -y $package_name
+        fi
     fi
 }
 
@@ -48,6 +49,8 @@ common_packages=(
     "xclip"
     "unzip"
 )
+
+for package in "${common_packages[@]}"; do
     echo "Installing $package..."
     install_package $package
 done
@@ -63,12 +66,6 @@ if [[ $OS == "linux" ]]; then
     sudo make install
     cd ..
     rm -rf tmux-mem-cpu-load
-fi
-
-# Install Oh My Zsh
-if [ ! -d "$HOME/.oh-my-zsh" ]; then
-    echo "Installing Oh My Zsh..."
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 fi
 
 # Install Keybase on Ubuntu
@@ -99,14 +96,32 @@ chmod +x "$HOME/.local/bin"/*
 # Import Keybase GPG keys
 echo "Importing Keybase GPG keys..."
 keybase pgp export -s | gpg --import
-# Remove existing .zshrc and stow all dotfiles
-rm -f "$HOME/.zshrc"
+
+# Install zsh and Oh My Zsh BEFORE stowing (but in unattended mode)
+install_package "zsh"
+if [ ! -d "$HOME/.oh-my-zsh" ]; then
+    echo "Installing Oh My Zsh..."
+    # Remove any existing .zshrc to avoid the overwrite prompt
+    rm -f "$HOME/.zshrc"
+    # Install Oh My Zsh in unattended mode to prevent shell spawn
+    # KEEP_ZSHRC=yes would keep existing .zshrc, but we want the template first
+    RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+fi
+
+# Remove Oh My Zsh's default .zshrc and stow our custom dotfiles
 echo "Stowing dotfiles..."
+rm -f "$HOME/.zshrc"
 for dir in */; do
     if [ -d "$dir" ]; then
         stow -v "$dir"
     fi
 done
+
+# Change default shell to zsh
+if [ "$SHELL" != "$(which zsh)" ]; then
+    echo "Changing default shell to zsh..."
+    chsh -s $(which zsh)
+fi
 
 echo "Installation complete!"
 echo "Please note:"
