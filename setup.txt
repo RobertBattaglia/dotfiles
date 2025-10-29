@@ -1,17 +1,44 @@
 install stow
 install tmux
 install tmux-mem-cpu-load
-install neovim
+	(Ubuntu:
+		install cmake and gcc and build-essential
+		Build
+			cmake .
+			make
+		Install
+			make install
+	)	
+install neovim 
+	(Ubuntu:
+		curl -LO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
+		sudo rm -rf /opt/nvim-linux-x86_64
+		sudo tar -C /opt -xzf nvim-linux-x86_64.tar.gz
+	)
 install fzf
 install ripgrep
 install oh my zsh
+	(sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)")
 install keybase
+	(Ubuntu:
+		curl --remote-name https://prerelease.keybase.io/keybase_amd64.deb
+		sudo apt install ./keybase_amd64.deb
+		run_keybase
+	)
 install gnupg
 install htop
-
+install xclip
+install nvm
+	(curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash)
+install unzip
 
 install patched font from nerd-fonts.
 Copy font files into /Library/Fonts on macOS or ~/.local/share/fonts on linux
 	(copy to linux dir and run command to symlink everything to mac dir) use the script in bin
 	go to preferences in terminal to change font to one just downloaded.
 	ensure the permissions are visible for iterm2
+
+add keybase secrets into gpg keychain
+	(keybase pgp export -s | gpg --import)
+
+make all ~/.local/bin files executable (chmod +x)

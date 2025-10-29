@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-
-find /usr/local/Caskroom -regex '.*\.ttf' -exec ln -s {} $HOME/.local/share/fonts \;
-find $HOME/.local/share/fonts -regex '.*\.ttf' -exec ln -s {} /Library/Fonts \;
-

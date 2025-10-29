@@ -8,6 +8,6 @@
 [core]
 	autocrlf = input
 	excludesfile = ~/.config/git/ignore
-	editer = nvim
+	editor = nvim
 [help]
 	autocorrect = 20

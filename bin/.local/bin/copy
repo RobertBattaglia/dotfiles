@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# copy_clipboard.sh
+#
+# Copy text to the system clipboard.
+#
+# Usage:
+#   echo "Hello world" | ./copy_clipboard.sh
+#   ./copy_clipboard.sh /path/to/file.txt
+#   # (or just: cat file.txt | ./copy_clipboard.sh)
+#
+# The script works on Linux (xclip or xsel) and macOS (pbcopy).
+# If no clipboard utility is found it exits with an error.
+
+set -euo pipefail   # safer Bash defaults
+
+# Detect a clipboard helper and store the command in $CLIP_CMD
+if command -v xclip &>/dev/null; then
+    CLIP_CMD="xclip -selection clipboard"
+elif command -v pbcopy &>/dev/null; then
+    CLIP_CMD="pbcopy"
+elif command -v xsel &>/dev/null; then
+    CLIP_CMD="xsel --clipboard --input"
+else
+    echo "❌  No clipboard utility found. Install xclip (Linux), pbcopy (macOS) or xsel." >&2
+    exit 1
+fi
+
+# Decide what to copy
+if [ $# -eq 0 ]; then
+    # No arguments – read from stdin
+    INPUT_CMD="cat"
+elif [ $# -eq 1 ]; then
+    # One argument – if it’s a readable file, cat it; otherwise treat it as a literal string
+    if [ -f "$1" ]; then
+        INPUT_CMD="cat \"$1\""
+    else
+        INPUT_CMD="echo \"$1\""
+    fi
+else
+    echo "⚠️  Usage: $0 [file]" >&2
+    exit 2
+fi
+
+# Pipe the chosen input into the clipboard command
+eval "$INPUT_CMD" | eval "$CLIP_CMD"
+
+# Success message (optional)
+echo "✅  Text copied to clipboard."
