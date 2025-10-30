@@ -1,6 +1,6 @@
 # append path
 path+=("$HOME/.local/bin")
-path+=("$PATH:/opt/nvim-linux64/bin")
+path+=("$PATH:/opt/nvim-linux-x86_64/bin")
 # prepend path path=('' $path)
 export PATH
 

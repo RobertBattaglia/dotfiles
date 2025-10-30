@@ -12,21 +12,29 @@ Personal development environment configuration managed with [GNU Stow](https://w
 
 ## 🚀 Quick Start
 
-### Installation
+### One-Step Installation
 
-Clone the repository and run the installation script:
+Download and run the bootstrap script on a fresh system:
 
 ```bash
-git clone --recurse-submodules <your-repo-url> ~/dotfiles
-cd ~/dotfiles
-./install.sh
+curl -O https://raw.githubusercontent.com/RobertBattaglia/dotfiles/main/bootstrap.sh
+chmod +x bootstrap.sh
+./bootstrap.sh
 ```
 
-The script will:
+The bootstrap script will:
+- ✅ Install GitHub CLI
+- ✅ Generate SSH key if needed
+- ✅ Authenticate with GitHub (supports 2FA via browser or Personal Access Token for SSH sessions)
+- ✅ Add SSH key to your GitHub account
+- ✅ Clone this repository with submodules
 - ✅ Install all required packages (stow, tmux, neovim, fzf, ripgrep, etc.)
 - ✅ Set up Oh My Zsh and nvm
 - ✅ Import GPG keys from Keybase
 - ✅ Symlink all dotfiles using Stow
+
+**For SSH sessions without browser access:**
+When prompted, create a Personal Access Token at https://github.com/settings/tokens/new with scopes: `repo`, `admin:public_key`, `read:org`
 
 ### Post-Installation
 

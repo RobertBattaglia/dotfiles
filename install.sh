@@ -110,7 +110,6 @@ fi
 
 # Remove Oh My Zsh's default .zshrc and stow our custom dotfiles
 echo "Stowing dotfiles..."
-rm -f "$HOME/.zshrc"
 for dir in */; do
     if [ -d "$dir" ]; then
         stow -v "$dir"

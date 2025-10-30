@@ -108,3 +108,6 @@ Note: There's a typo in README.md ("sumodule" should be "submodule").
 - Alias: `opengit` - Opens current git remote in Chrome
 - Sources `.zsh_profile` which adds `~/.local/bin` and `/opt/nvim-linux-x86_64/bin` to PATH
 - Sets `GPG_TTY=$(tty)` for GPG signing
+
+## Memories
+- Always use descriptive variable names
