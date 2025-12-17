@@ -8,6 +8,7 @@ Personal development environment configuration managed with [GNU Stow](https://w
 - **Terminal Multiplexer**: Tmux with custom keybindings and status bar
 - **Editor**: Neovim (using [kickstart.nvim](https://github.com/nvim-lua/kickstart.nvim) fork)
 - **Version Control**: Git with GPG signing enabled
+- **GPG Agent**: Configured with 1-week passphrase caching for seamless commit signing
 - **Custom Scripts**: Productivity tools for tmux sessions, AI commit messages, clipboard management, and more
 
 ## 🚀 Quick Start
@@ -107,6 +108,7 @@ Located in `~/.local/bin`:
 ## 📝 Customization
 
 - **Git**: Edit `git/.config/git/config` for user info and signing keys
+- **GPG**: Configure `gnupg/.gnupg/gpg-agent.conf` for passphrase caching settings
 - **Tmux**: Modify `tmux/.config/tmux/tmux.conf`
 - **Zsh**: Update `zsh/.zshrc` and `zsh/.zsh_profile`
 - **Scripts**: Add custom scripts to `bin/.local/bin/`

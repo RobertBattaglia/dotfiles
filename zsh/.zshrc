@@ -79,6 +79,7 @@ source $ZSH/oh-my-zsh.sh
 export MAX_KEPT=1 # for indeed RAD artifacts
 export GPG_TTY=$(tty)
 
+
 # export MANPATH="/usr/local/man:$MANPATH"
 
 # You may need to manually set your language environment
@@ -99,6 +100,7 @@ export GPG_TTY=$(tty)
 # users are encouraged to define aliases within the ZSH_CUSTOM folder.
 # For a full list of active aliases, run `alias`.
 alias opengit="open -a \"Google Chrome\" \"https://\$(git remote -v | head -1 | tr \"@\" \"\n\" | tail -1 | awk '{ print \$1 }' | tr \":\" \"/\")\""
+export HOSTNAME=$(hostname)
 
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
@@ -106,9 +108,21 @@ alias opengit="open -a \"Google Chrome\" \"https://\$(git remote -v | head -1 | 
 
 source ~/.zsh_profile
 
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
-[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
 autoload -U +X bashcompinit && bashcompinit
 complete -o nospace -C /usr/local/bin/terraform terraform
+# BEGIN env Setup -- Managed by Ansible DO NOT EDIT.
+
+# Setup INDEED_ENV_DIR earlier.
+if [ -z "${INDEED_ENV_DIR}" ]; then
+    export INDEED_ENV_DIR="/Users/robbattaglia/env"
+fi
+
+# Single-brace syntax because this is required in bash and sh alike
+if [ -e "${INDEED_ENV_DIR}/etc/indeedrc" ]; then
+    . "${INDEED_ENV_DIR}/etc/indeedrc"
+fi
+# END env Setup -- Managed by Ansible DO NOT EDIT.
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - zsh)"
