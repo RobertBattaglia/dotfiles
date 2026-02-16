@@ -32,7 +32,7 @@ git ls-files --exclude-standard -oi --directory >> $tmp_exclude_file
 echo ".git" >> $tmp_exclude_file
 
 # Use RSC_HOST environment variable if set, otherwise use default
-RSC_HOST="${RSC_HOST:-rbattaglia@rbattaglia.cvm.indeed.net}"
+RSC_HOST="${RSC_HOST:-rbattaglia@rbattaglia-2.cvm.indeed.net}"
 cvm=${RSC_HOST}:$(dirs)
 
 src=$([ "$r_flag" = 'true' ] && echo "$cvm" || echo "$PWD")

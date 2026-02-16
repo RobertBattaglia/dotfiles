@@ -78,6 +78,7 @@ source $ZSH/oh-my-zsh.sh
 
 export MAX_KEPT=1 # for indeed RAD artifacts
 export GPG_TTY=$(tty)
+export LDAPUSER="rbattaglia"
 
 
 # export MANPATH="/usr/local/man:$MANPATH"
@@ -105,6 +106,7 @@ export HOSTNAME=$(hostname)
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
+alias jdtls="~/dotfiles/nvim/.config/nvim/ftplugin/jdtls-wrapper"
 
 source ~/.zsh_profile
 
@@ -126,3 +128,8 @@ fi
 export PYENV_ROOT="$HOME/.pyenv"
 [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
 eval "$(pyenv init - zsh)"
+
+
+# Added by ToolHive UI - do not modify this block
+export PATH="$HOME/.toolhive/bin:$PATH"
+# End ToolHive UI
