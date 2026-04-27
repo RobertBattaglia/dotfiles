@@ -101,7 +101,6 @@ export LDAPUSER="rbattaglia"
 # users are encouraged to define aliases within the ZSH_CUSTOM folder.
 # For a full list of active aliases, run `alias`.
 alias opengit="open -a \"Google Chrome\" \"https://\$(git remote -v | head -1 | tr \"@\" \"\n\" | tail -1 | awk '{ print \$1 }' | tr \":\" \"/\")\""
-export HOSTNAME=$(hostname)
 
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
@@ -124,6 +123,10 @@ fi
 if [ -e "${INDEED_ENV_DIR}/etc/indeedrc" ]; then
     . "${INDEED_ENV_DIR}/etc/indeedrc"
 fi
+
+# Enable AWS CLI command completion
+autoload bashcompinit && bashcompinit
+complete -C '/opt/homebrew/bin/aws_completer' aws
 # END env Setup -- Managed by Ansible DO NOT EDIT.
 export PYENV_ROOT="$HOME/.pyenv"
 [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
@@ -133,3 +136,8 @@ eval "$(pyenv init - zsh)"
 # Added by ToolHive UI - do not modify this block
 export PATH="$HOME/.toolhive/bin:$PATH"
 # End ToolHive UI
+export ANDROID_HOME="/Users/<LDAP>/Library/Android/sdk"
+export PATH=$ANDROID_HOME/platform-tools:$PATH
+export PATH=$ANDROID_HOME/tools:$PATH
+export PATH=$ANDROID_HOME/tools/bin:$PATH
+
