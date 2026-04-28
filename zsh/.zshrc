@@ -79,6 +79,7 @@ source $ZSH/oh-my-zsh.sh
 export MAX_KEPT=1 # for indeed RAD artifacts
 export GPG_TTY=$(tty)
 export LDAPUSER="rbattaglia"
+export EDITOR="nvim"
 
 
 # export MANPATH="/usr/local/man:$MANPATH"
