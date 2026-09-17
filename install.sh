@@ -25,11 +25,11 @@ install_package() {
         # Special handling for neovim on Ubuntu
         if [[ $package_name == "neovim" ]]; then
             echo "Installing Neovim stable version..."
-            curl -LO https://github.com/neovim/neovim/releases/latest/download/nvim-linux64.tar.gz
-            sudo rm -rf /opt/nvim
-            sudo tar -C /opt -xzf nvim-linux64.tar.gz
-            sudo ln -sf /opt/nvim-linux64/bin/nvim /usr/local/bin/nvim
-            rm nvim-linux64.tar.gz
+            curl -fLO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
+            sudo rm -rf /opt/nvim-linux-x86_64
+            sudo tar -C /opt -xzf nvim-linux-x86_64.tar.gz
+            sudo ln -sf /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+            rm nvim-linux-x86_64.tar.gz
         else
             sudo apt-get install -y $package_name
         fi
