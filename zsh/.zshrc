@@ -126,7 +126,10 @@ if [ -e "${INDEED_ENV_DIR}/etc/indeedrc" ]; then
 fi
 
 # Enable AWS CLI command completion
-autoload bashcompinit && bashcompinit
+if (( ! ${+functions[compdef]} )); then
+    autoload -Uz compinit && compinit -i
+fi
+autoload -Uz bashcompinit && bashcompinit
 complete -C '/opt/homebrew/bin/aws_completer' aws
 # END env Setup -- Managed by Ansible DO NOT EDIT.
 export PYENV_ROOT="$HOME/.pyenv"
@@ -137,8 +140,9 @@ eval "$(pyenv init - zsh)"
 # Added by ToolHive UI - do not modify this block
 export PATH="$HOME/.toolhive/bin:$PATH"
 # End ToolHive UI
-export ANDROID_HOME="/Users/<LDAP>/Library/Android/sdk"
-export PATH=$ANDROID_HOME/platform-tools:$PATH
-export PATH=$ANDROID_HOME/tools:$PATH
-export PATH=$ANDROID_HOME/tools/bin:$PATH
+export ANDROID_HOME=$HOME/Library/Android/sdk
+export PATH=$PATH:$ANDROID_HOME/emulator
+export PATH=$PATH:$ANDROID_HOME/platform-tools
+export PATH=$PATH:$ANDROID_HOME/tools
+export PATH=$PATH:$ANDROID_HOME/tools/bin
 
