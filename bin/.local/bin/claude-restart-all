@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Restart running Claude Code sessions (in tmux) on the latest installed version,
+# resuming each conversation in the same pane.
+#
+# Usage: claude-restart-all [--dry-run] [--force] [--all]
+#   --dry-run  show what would be restarted, change nothing
+#   --force    also restart sessions that are busy / waiting on a permission prompt
+#   --all      restart even sessions already on the latest version
+set -uo pipefail
+
+DRY_RUN=0 FORCE=0 ALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --force)   FORCE=1 ;;
+    --all)     ALL=1 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
+
+SESSIONS_DIR="$HOME/.claude/sessions"
+LATEST=$(claude --version 2>/dev/null | awk '{print $1}')
+[[ -n "$LATEST" ]] || { echo "could not determine installed claude version" >&2; exit 1; }
+echo "Installed version: $LATEST"
+
+# If this script was launched from inside a Claude session, restart that one last.
+SELF_PID=""
+p=$$
+while [[ "$p" -gt 1 ]]; do
+  [[ -f "$SESSIONS_DIR/$p.json" ]] && { SELF_PID=$p; break; }
+  p=$(ps -o ppid= -p "$p" | tr -d ' ')
+done
+
+# Carry over a few launch flags from the original command line.
+carry_flags() {
+  local pid=$1 out=() args
+  read -r -a args <<<"$(ps -o args= -p "$pid")"
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+      --permission-mode|--model|--add-dir|--agent) out+=("${args[i]}" "${args[i+1]:-}"); ((i++)) ;;
+      --dangerously-skip-permissions|--chrome|--verbose) out+=("${args[i]}") ;;
+    esac
+  done
+  [[ ${#out[@]} -gt 0 ]] && printf '%q ' "${out[@]}"
+}
+
+restart_one() {
+  local f=$1 pid sid cwd ver status pane pane_pid flags cmd
+  pid=$(jq -r .pid "$f"); sid=$(jq -r .sessionId "$f"); cwd=$(jq -r .cwd "$f")
+  ver=$(jq -r '.version // "?"' "$f"); status=$(jq -r '.status // "?"' "$f")
+  pane=$(jq -r '.tmux // empty' "$f"); pane=${pane##*.}   # "sess:@win.%pane" -> "%pane"
+  local label; label="$pid [$(jq -r '.name // "-"' "$f")] v$ver $status"
+
+  kill -0 "$pid" 2>/dev/null || return 0                    # stale file
+  [[ $(jq -r '.kind // "interactive"' "$f") == interactive ]] || return 0
+  if [[ $ALL -eq 0 && "$ver" == "$LATEST" ]]; then echo "skip  $label (up to date)"; return 0; fi
+  if [[ $FORCE -eq 0 && "$status" != idle ]]; then echo "skip  $label (not idle; use --force)"; return 0; fi
+  if [[ -z "$pane" ]] || ! tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+    echo "skip  $label (not in a tmux pane)"; return 0
+  fi
+
+  flags=$(carry_flags "$pid")
+  cmd="claude ${flags}--resume $sid"
+  echo "restart $label  pane=$pane  cwd=$cwd"
+  echo "        -> $cmd"
+  [[ $DRY_RUN -eq 1 ]] && return 0
+
+  pane_pid=$(tmux display -p -t "$pane" '#{pane_pid}')
+  if [[ "$pane_pid" == "$pid" ]]; then
+    # Claude is the pane's root process; exiting would close the pane, so respawn it.
+    tmux respawn-pane -k -t "$pane" -c "$cwd" "$cmd; exec \$SHELL -l"
+    return 0
+  fi
+
+  # Claude runs under a shell in the pane: stop it, then relaunch from that shell.
+  kill -TERM "$pid"
+  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid"; sleep 0.5; fi
+  tmux send-keys -t "$pane" C-u
+  tmux send-keys -t "$pane" -l "cd $(printf %q "$cwd") && $cmd"
+  tmux send-keys -t "$pane" Enter
+}
+
+for f in "$SESSIONS_DIR"/*.json; do
+  [[ -e "$f" ]] || continue
+  [[ "$(basename "$f" .json)" == "$SELF_PID" ]] && continue
+  restart_one "$f"
+done
+[[ -n "$SELF_PID" ]] && restart_one "$SESSIONS_DIR/$SELF_PID.json"

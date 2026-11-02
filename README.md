@@ -105,6 +105,63 @@ Located in `~/.local/bin`:
 ### Zsh Aliases
 - `opengit` - Open current git repository in Chrome
 
+## 🤖 Claude Code Hooks
+
+Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claude Code and Indeed installers). Instead, manually merge these custom hooks into the `"hooks"` object in `~/.claude/settings.json`. If an event already has entries, append these to its array.
+
+- **Notification sound**: plays a sound when Claude asks for permission (macOS `afplay`; update the mp3 path)
+- **Tmux waiting indicator**: sets the `@claude_waiting` window option when Claude needs input, and clears it on activity. `tmux.conf` highlights those windows in the status bar and choose-tree (`<prefix>W` lists only waiting windows)
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "afplay -v 3 ~/Music/orcpeon.mp3" }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -w -t \"$TMUX_PANE\" @claude_waiting 1 || true" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+        ]
+      }
+    ]
+  }
+}
+```
+
 ## 📝 Customization
 
 - **Git**: Edit `git/.config/git/config` for user info and signing keys
