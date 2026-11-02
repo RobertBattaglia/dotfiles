@@ -70,8 +70,6 @@ Update submodule to latest commit:
 git submodule update --remote
 ```
 
-Note: There's a typo in README.md ("sumodule" should be "submodule").
-
 ## Custom Scripts in bin/.local/bin/
 
 - `tmux-sessionizer` - Fuzzy finder for creating/switching tmux sessions from directories (bound to `<prefix>f` in tmux)

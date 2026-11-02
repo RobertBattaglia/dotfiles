@@ -2,3 +2,4 @@
 	path = nvim/.config/nvim
 	url = git@github.com:RobertBattaglia/kickstart.nvim
 	branch = main
+	ignore = untracked
