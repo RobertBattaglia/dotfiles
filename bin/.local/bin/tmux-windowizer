@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Fuzzy finder for tmux windows across all sessions (bound to <prefix>g in tmux). Searches the window name,
+# the active pane's directory, and its pane title (e.g. Claude Code's task summary).
+# Enter on a match jumps to that window. If nothing matches, Enter creates a new window named
+# after the typed query in the current session.
+# Claude Code windows are marked: red = waiting for input, purple = agent running.
+#
+# Usage: tmux-windowizer [SESSION_ID] [START_DIRECTORY]
+#   (tmux.conf passes the current session and pane path; both are optional)
+set -uo pipefail
+
+current_session_id=${1:-}
+start_directory=${2:-$PWD}
+
+RED_DOT=$'\e[38;2;185;28;28m●\e[0m'
+PURPLE_DOT=$'\e[38;2;124;58;237m●\e[0m'
+
+DIM=$'\e[2m' RESET=$'\e[0m'
+
+# One line per window: "window_id<TAB><marker> session:index  name  ~/dir  title"
+# Pane titles are dropped when they are the shell's default "user@host:dir" or just repeat the window name.
+list_windows() {
+  tmux list-windows -a -F $'#{window_id}\t#{?@claude_waiting,waiting,#{?@claude_running,running,}}\t#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{?#{m:*@#{host_short}:*,#{pane_title}},,#{?#{==:#{pane_title},#{window_name}},,#{pane_title}}}' |
+    awk -F'\t' -v red="$RED_DOT" -v purple="$PURPLE_DOT" -v home="$HOME" -v dim="$DIM" -v reset="$RESET" '{
+      marker = ($2 == "waiting") ? red : ($2 == "running") ? purple : " "
+      directory = $5
+      if (index(directory, home) == 1) directory = "~" substr(directory, length(home) + 1)
+      title = ($6 == "") ? "" : "  " $6
+      printf "%s\t%s %s  %s  %s%s%s%s\n", $1, marker, $3, $4, dim, directory, reset, title
+    }'
+}
+
+fzf_output=$(list_windows | fzf --ansi --print-query --delimiter=$'\t' --with-nth=2 \
+  --prompt="window> " \
+  --preview='tmux capture-pane -ep -t {1}' --preview-window=right,60%)
+
+query=$(sed -n 1p <<<"$fzf_output")
+selected_line=$(sed -n 2p <<<"$fzf_output")
+
+if [[ -n "$selected_line" ]]; then
+  tmux switch-client -t "${selected_line%%$'\t'*}"
+elif [[ -n "$query" ]]; then
+  tmux new-window ${current_session_id:+-t "$current_session_id:"} -n "$query" -c "$start_directory"
+fi

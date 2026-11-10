@@ -93,6 +93,7 @@ Located in `~/.local/bin`:
 | `contributizer` | Visualize git blame statistics by author |
 | `copy` | Cross-platform clipboard utility |
 | `rsc` | Rsync wrapper for remote syncing (set `RSC_HOST` to configure) |
+| `claude-tmux-state` | Claude Code hook helper: tmux running/waiting window colours and spoken alerts (see below) |
 
 ## ⌨️ Key Bindings
 
@@ -109,22 +110,40 @@ Located in `~/.local/bin`:
 
 Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claude Code and Indeed installers). Instead, manually merge these custom hooks into the `"hooks"` object in `~/.claude/settings.json`. If an event already has entries, append these to its array.
 
-- **Notification sound**: plays a sound when Claude asks for permission (macOS `afplay`; update the mp3 path)
-- **Tmux waiting indicator**: sets the `@claude_waiting` window option when Claude needs input, and clears it on activity. `tmux.conf` highlights those windows in the status bar and choose-tree (`<prefix>W` lists only waiting windows)
+- **Tmux status indicators + spoken alerts**: every hook calls `claude-tmux-state` (in `bin/`), which sets window options that `tmux.conf` highlights in the status bar, `<prefix>w`/`<prefix>W`, and `tmux-windowizer`:
+
+  | Hook | `claude-tmux-state` | Window | Spoken (macOS `say`) |
+  |------|---------------------|--------|----------------------|
+  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `running` | purple (`@claude_running`) | — |
+  | `Notification` | `waiting` | red (`@claude_waiting`) | `<window> needs input`, if it was running |
+  | `Stop` | `idle` | red (`@claude_waiting`) | `<window> done`, if it was running |
+  | `SessionEnd` | `clear` | no colour | — |
+
+  - Named windows are announced by name; auto-named windows by Claude's task summary (the pane title). Nothing is spoken for the window you're currently looking at. Set `CLAUDE_TMUX_SPEAK=0` to mute, or `CLAUDE_TMUX_SPEAK_VOLUME` (default `0.6`, `1` = normal) to change loudness without touching system volume
+  - Claude's later idle reminder (`Notification`, ~60s after finishing) is a no-op: the window is already red and wasn't running, so nothing is spoken
+  - `Stop` doesn't fire when you interrupt with Esc, so the window stays purple until your next prompt (or `<prefix>a`)
+  - `<prefix>W` lists only Claude windows that are waiting or running; `<prefix>a` / `<prefix>A` clear both flags for the current / all windows
 
 ```json
 {
   "hooks": {
     "Notification": [
       {
-        "matcher": "permission_prompt",
         "hooks": [
-          { "type": "command", "command": "afplay -v 3 ~/Music/orcpeon.mp3" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state waiting || true"
+          }
         ]
-      },
+      }
+    ],
+    "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -w -t \"$TMUX_PANE\" @claude_waiting 1 || true" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state running || true"
+          }
         ]
       }
     ],
@@ -132,7 +151,10 @@ Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claud
       {
         "matcher": ".*",
         "hooks": [
-          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state running || true"
+          }
         ]
       }
     ],
@@ -140,21 +162,30 @@ Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claud
       {
         "matcher": ".*",
         "hooks": [
-          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state running || true"
+          }
         ]
       }
     ],
-    "UserPromptSubmit": [
+    "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state idle || true"
+          }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "[ -n \"$TMUX_PANE\" ] && tmux set -wu -t \"$TMUX_PANE\" @claude_waiting || true" }
+          {
+            "type": "command",
+            "command": "~/.local/bin/claude-tmux-state clear || true"
+          }
         ]
       }
     ]

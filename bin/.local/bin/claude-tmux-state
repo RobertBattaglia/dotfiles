@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Called by Claude Code hooks to update this tmux window's Claude status flags
+# (@claude_running = purple, @claude_waiting = red in tmux.conf), and to announce via
+# text-to-speech when a running Claude stops to wait on you or finishes.
+#
+# Usage: claude-tmux-state running|waiting|idle|clear
+#   running  prompt submitted / tool activity     -> purple
+#   waiting  Notification (needs input)           -> red, says "<window> needs input" if it was running
+#   idle     Stop (turn finished)                 -> red (your turn), says "<window> done" if it was running
+#   clear    SessionEnd                           -> no colour, silent
+#
+# Set CLAUDE_TMUX_SPEAK=0 to silence announcements.
+# Set CLAUDE_TMUX_SPEAK_VOLUME (afplay volume, 1 = normal, default 0.6) to adjust loudness without
+# touching the system volume.
+set -uo pipefail
+
+[[ -n "${TMUX_PANE:-}" ]] || exit 0
+new_state=${1:-}
+
+# Window is "being looked at" when it is the active window of an attached session.
+{
+  IFS= read -r was_running
+  IFS= read -r is_watched
+  IFS= read -r automatic_rename
+  IFS= read -r window_name
+  IFS= read -r pane_title
+} < <(tmux display -p -t "$TMUX_PANE" \
+  $'#{?@claude_running,1,0}\n#{&&:#{window_active},#{session_attached}}\n#{automatic-rename}\n#{window_name}\n#{pane_title}' 2>/dev/null)
+
+case "$new_state" in
+  running) tmux set -wu -t "$TMUX_PANE" @claude_waiting \; set -w -t "$TMUX_PANE" @claude_running 1 ;;
+  waiting) tmux set -w -t "$TMUX_PANE" @claude_waiting 1 \; set -wu -t "$TMUX_PANE" @claude_running ;;
+  idle)    tmux set -w -t "$TMUX_PANE" @claude_waiting 1 \; set -wu -t "$TMUX_PANE" @claude_running ;;
+  clear)   tmux set -wu -t "$TMUX_PANE" @claude_waiting \; set -wu -t "$TMUX_PANE" @claude_running ;;
+  *)       echo "usage: $(basename "$0") running|waiting|idle|clear" >&2; exit 2 ;;
+esac
+
+[[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && "$was_running" == 1 && "$is_watched" != 1 ]] || exit 0
+case "$new_state" in
+  waiting) suffix="needs input" ;;
+  idle)    suffix="done" ;;
+  *)       exit 0 ;;
+esac
+
+# Named windows (automatic-rename off) say their name; auto-named ones say Claude's task summary.
+spoken_name=$window_name
+if [[ "$automatic_rename" == 1 ]]; then
+  spoken_name=$(sed -E 's/^[^[:alnum:]]+//' <<<"$pane_title")
+fi
+[[ -n "$spoken_name" ]] || spoken_name="Claude"
+
+# say has no volume option, so render to a temp file and play it with afplay's per-sound volume.
+# Detached so the hook returns immediately.
+speak_volume=${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}
+nohup bash -c '
+  speech_file=$(mktemp -t claude-tmux-speak).aiff
+  say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
+  rm -f "$speech_file" "${speech_file%.aiff}"
+' _ "$spoken_name $suffix" "$speak_volume" >/dev/null 2>&1 &
+exit 0
