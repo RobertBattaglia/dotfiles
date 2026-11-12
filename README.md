@@ -93,6 +93,7 @@ Located in `~/.local/bin`:
 | `contributizer` | Visualize git blame statistics by author |
 | `copy` | Cross-platform clipboard utility |
 | `rsc` | Rsync wrapper for remote syncing (set `RSC_HOST` to configure) |
+| `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title; jump or create (bound to `<prefix>Space`) |
 | `claude-tmux-state` | Claude Code hook helper: tmux running/waiting window colours and spoken alerts (see below) |
 
 ## ⌨️ Key Bindings
@@ -102,6 +103,11 @@ Located in `~/.local/bin`:
 - `<prefix>Tab` - Switch to last session
 - `<prefix>j/k` - Next/previous session
 - `<prefix>f` - Launch tmux-sessionizer
+- `<prefix>Space` - Launch tmux-windowizer
+- `<prefix>w` - Tree view of sessions/windows (Claude windows coloured: purple = running, red = waiting/done)
+- `<prefix>W` - Tree view of only Claude windows that are running or waiting
+- `<prefix>q` - Set a shortcut key for the current window in the tree view, shown as `[K]` in the status bar (empty clears; capital letters are safest)
+- `<prefix>a` / `<prefix>A` - Clear Claude highlights for the current / all windows
 
 ### Zsh Aliases
 - `opengit` - Open current git repository in Chrome
