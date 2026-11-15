@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""Claude thread registry: durable per-session state for Claude Code sessions run in tmux.
+
+One JSON file per Claude session_id in ${XDG_STATE_HOME:-~/.local/state}/claude-threads/threads/.
+claude-tmux-state (the hook) writes the core fields; this CLI owns pin / snooze / settle and reconciliation.
+Every writer takes the same per-thread mkdir lock (threads/.locks/<id>.lock) and writes tmp + rename.
+
+Targets: @<window_id> | %<pane_id> | thread:<session_id> | <session_id or unique prefix> | (empty = current pane)
+
+Usage:
+  claude-threads list [--json]                    all threads, pinned first, newest activity first
+  claude-threads show <target>                    metadata + recent prompts (fzf preview)
+  claude-threads set <target> key=value ...       manual override (values parsed as JSON when possible)
+  claude-threads pin <target> [--label TEXT]      pin; label defaults to Claude's task summary
+  claude-threads unpin <target> | toggle-pin <target>
+  claude-threads pinned [--rows [closed]]         fzf picker of pinned threads (Enter opens, ctrl-t unpins)
+  claude-threads open <target> [--session ID]     jump to the thread's window, or resume it in a new one
+  claude-threads remember-tree-key <window_id>    store the window's @tree_key on its thread
+  claude-threads snooze <target> <when...>        30m 2h 1h30m 3d 1w 45 | 14:30 9am | tomorrow [8am] | mon [10am]
+                                                  | tonight [8] | today 4pm ; empty/wake/off/0 wakes
+  claude-threads wake <target>
+  claude-threads wake-due                         wake threads whose snooze has expired (called by claude-threads-tick)
+  claude-threads settle <target> [--kill]         done with it: leaves active views, stays searchable/resumable
+  claude-threads unsettle <target>
+  claude-threads sweep [--if-older-than SECONDS]  backfill transcripts, detect closed sessions, auto-settle
+
+Environment / config ($STATE/claude-threads/config, KEY=VALUE lines; env wins):
+  CLAUDE_THREADS_SETTLE_DAYS (SETTLE_DAYS)     auto-settle threads inactive this long (default 3)
+  CLAUDE_SNOOZE_MORNING_HOUR (MORNING_HOUR)    hour used for "tomorrow" / weekdays with no time (default 9)
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+STATE_ROOT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "claude-threads")
+THREADS_DIR = os.path.join(STATE_ROOT, "threads")
+LOCKS_DIR = os.path.join(THREADS_DIR, ".locks")
+NEXT_WAKE_FILE = os.path.join(STATE_ROOT, "snooze_next_wake_at")
+SWEEP_STAMP_FILE = os.path.join(STATE_ROOT, ".last-sweep")
+SWEEP_LOCK_DIR = os.path.join(STATE_ROOT, ".sweep.lock")
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+SPEAK_COMMAND = os.path.expanduser("~/.local/bin/claude-tmux-speak")
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
+CLOSE_GRACE_SECONDS = 60
+TRANSCRIPT_CHUNK_BYTES = 256 * 1024
+AMBER, GREEN, RED, PURPLE, GRAY = "\033[38;2;245;158;11m", "\033[38;2;21;128;61m", "\033[38;2;185;28;28m", "\033[38;2;124;58;237m", "\033[38;2;156;163;175m"
+DIM, RESET = "\033[2m", "\033[0m"
+
+
+def load_config():
+    config_values = {}
+    config_path = os.path.join(STATE_ROOT, "config")
+    if os.path.exists(config_path):
+        for line in open(config_path):
+            key, separator, value = line.strip().partition("=")
+            if separator and not key.startswith("#"):
+                config_values[key.strip()] = value.strip().strip("'\"")
+    return config_values
+
+
+CONFIG = load_config()
+SETTLE_DAYS = float(os.environ.get("CLAUDE_THREADS_SETTLE_DAYS") or CONFIG.get("SETTLE_DAYS") or 3)
+MORNING_HOUR = int(os.environ.get("CLAUDE_SNOOZE_MORNING_HOUR") or CONFIG.get("MORNING_HOUR") or 9)
+
+
+def now_epoch():
+    return int(time.time())
+
+
+class CommandError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- tmux / output helpers
+
+def in_tmux():
+    return bool(os.environ.get("TMUX"))
+
+
+def tmux(*arguments):
+    """Run a tmux command; returns stdout (stripped) or None on failure."""
+    try:
+        completed = subprocess.run(["tmux", *arguments], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return completed.stdout.rstrip("\n") if completed.returncode == 0 else None
+
+
+def notify(message):
+    if in_tmux():
+        tmux("display-message", message)
+    else:
+        print(message)
+
+
+def speak(text):
+    if os.access(SPEAK_COMMAND, os.X_OK):
+        subprocess.Popen([SPEAK_COMMAND, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def format_clock(epoch_seconds, with_date=False):
+    moment = datetime.datetime.fromtimestamp(epoch_seconds)
+    return moment.strftime("%a %b %-d %H:%M" if with_date else "%a %H:%M")
+
+
+def format_age(epoch_seconds):
+    if not epoch_seconds:
+        return "?"
+    elapsed_seconds = max(0, now_epoch() - int(epoch_seconds))
+    for unit_seconds, unit_name in ((86400, "d"), (3600, "h"), (60, "m")):
+        if elapsed_seconds >= unit_seconds:
+            return f"{elapsed_seconds // unit_seconds}{unit_name}"
+    return "now"
+
+
+def shorten_home(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path and path.startswith(home) else (path or "")
+
+
+# ---------------------------------------------------------------- registry storage
+
+def thread_path(session_id):
+    return os.path.join(THREADS_DIR, session_id + ".json")
+
+
+def acquire_lock(lock_dir, timeout_seconds=2.0, steal_when_stale=True):
+    deadline = time.time() + timeout_seconds
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return True
+        except FileExistsError:
+            if time.time() > deadline:
+                if not steal_when_stale:
+                    return False
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+                deadline = time.time() + timeout_seconds
+            time.sleep(0.01)
+
+
+def release_lock(lock_dir):
+    try:
+        os.rmdir(lock_dir)
+    except OSError:
+        pass
+
+
+def load_thread(session_id):
+    try:
+        with open(thread_path(session_id)) as thread_file:
+            return json.load(thread_file)
+    except (OSError, ValueError):
+        return None
+
+
+def update_thread(session_id, mutate):
+    """Locked read-modify-write. `mutate(thread)` edits the dict in place. Never clobbers corrupt JSON."""
+    if not SESSION_ID_PATTERN.match(session_id):
+        raise CommandError(f"bad session id {session_id!r}")
+    os.makedirs(LOCKS_DIR, exist_ok=True)
+    lock_dir = os.path.join(LOCKS_DIR, session_id + ".lock")
+    acquire_lock(lock_dir)
+    try:
+        path = thread_path(session_id)
+        try:
+            with open(path) as thread_file:
+                thread = json.load(thread_file)
+        except FileNotFoundError:
+            thread = {}
+        except ValueError:
+            print(f"claude-threads: corrupt {path}, not modified", file=sys.stderr)
+            return None
+        before = json.dumps(thread, sort_keys=True)
+        thread.setdefault("session_id", session_id)
+        mutate(thread)
+        if json.dumps(thread, sort_keys=True) != before:
+            temporary_path = f"{path}.tmp.{os.getpid()}"
+            with open(temporary_path, "w") as thread_file:
+                json.dump(thread, thread_file, indent=1)
+            os.replace(temporary_path, path)
+        return thread
+    finally:
+        release_lock(lock_dir)
+
+
+def all_threads():
+    threads = []
+    for path in glob.glob(os.path.join(THREADS_DIR, "*.json")):
+        try:
+            with open(path) as thread_file:
+                threads.append(json.load(thread_file))
+        except (OSError, ValueError):
+            continue
+    return threads
+
+
+def live_claude_processes():
+    """sessionId -> info from ~/.claude/sessions/<pid>.json for interactive Claude processes still alive."""
+    live_sessions = {}
+    for session_file in glob.glob(os.path.join(CLAUDE_SESSIONS_DIR, "*.json")):
+        try:
+            with open(session_file) as handle:
+                info = json.load(handle)
+            os.kill(int(info["pid"]), 0)
+        except PermissionError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if info.get("kind", "interactive") == "interactive" and info.get("sessionId"):
+            live_sessions[info["sessionId"]] = info
+    return live_sessions
+
+
+# ---------------------------------------------------------------- target resolution
+
+def session_for_window(window_id):
+    session_id = tmux("show", "-wv", "-t", window_id, "@claude_session_id")
+    if session_id:
+        return session_id
+    for session_id, info in live_claude_processes().items():
+        if f":{window_id}." in (info.get("tmux") or ""):
+            return session_id
+    candidates = [thread for thread in all_threads()
+                  if thread.get("tmux_window_id") == window_id and thread.get("live_state") != "closed"]
+    if candidates:
+        return max(candidates, key=lambda thread: thread.get("last_activity_at") or 0)["session_id"]
+    return None
+
+
+def resolve_target(target):
+    """Returns (session_id, window_id_or_None)."""
+    target = (target or "").strip()
+    if not target:
+        target = os.environ.get("TMUX_PANE", "")
+        if not target:
+            raise CommandError("no target given and not inside tmux")
+    if target.startswith("%"):
+        window_id = tmux("display", "-p", "-t", target, "#{window_id}")
+        if not window_id:
+            raise CommandError(f"no such pane {target}")
+        target = window_id
+    if target.startswith("@"):
+        session_id = session_for_window(target)
+        if not session_id:
+            raise CommandError("No Claude thread in this window")
+        return session_id, target
+    session_prefix = target.removeprefix("thread:")
+    if os.path.exists(thread_path(session_prefix)):
+        return session_prefix, None
+    matches = [os.path.basename(path)[:-5] for path in glob.glob(os.path.join(THREADS_DIR, glob.escape(session_prefix) + "*.json"))]
+    if len(matches) == 1:
+        return matches[0], None
+    raise CommandError(f"{'ambiguous' if matches else 'unknown'} thread {session_prefix!r}")
+
+
+def live_window_of(session_id, thread=None):
+    """The thread's window id, only if that window still holds this session."""
+    thread = thread or load_thread(session_id) or {}
+    window_id = thread.get("tmux_window_id")
+    if window_id and tmux("show", "-wv", "-t", window_id, "@claude_session_id") == session_id:
+        return window_id
+    return None
+
+
+def mirror_to_window(session_id, thread=None, window_id=None):
+    """Push pin / snooze / settle markers from the registry onto the thread's live window."""
+    thread = thread or load_thread(session_id) or {}
+    window_id = window_id or live_window_of(session_id, thread)
+    if not window_id:
+        return
+    commands = []
+
+    def set_option(option_name, option_value):
+        if option_value in (None, "", False):
+            commands.extend(["set", "-wu", "-t", window_id, option_name, ";"])
+        else:
+            commands.extend(["set", "-w", "-t", window_id, option_name, str(option_value), ";"])
+
+    snoozed_until = thread.get("snoozed_until") or 0
+    is_snoozed = snoozed_until > now_epoch()
+    set_option("@claude_session_id", session_id)
+    set_option("@claude_pinned", "1" if thread.get("pinned") else "")
+    set_option("@claude_snoozed", "1" if is_snoozed else "")
+    set_option("@claude_snoozed_label", format_clock(snoozed_until) if is_snoozed else "")
+    set_option("@claude_snooze_news", "1" if is_snoozed and thread.get("snooze_news") else "")
+    set_option("@claude_settled", "1" if thread.get("settled") else "")
+    tmux(*commands[:-1])
+
+
+# ---------------------------------------------------------------- list / show / set
+
+def thread_marks(thread):
+    marks = ""
+    if thread.get("pinned"):
+        marks += AMBER + "^" + RESET
+    if (thread.get("snoozed_until") or 0) > now_epoch():
+        marks += GRAY + "z" + RESET
+    if thread.get("settled"):
+        marks += DIM + "s" + RESET
+    outcome = thread.get("outcome")
+    live_state = thread.get("live_state")
+    if outcome == "needs_approval":
+        marks += AMBER + "◆" + RESET
+    elif outcome == "failed":
+        marks += RED + "✗" + RESET
+    elif live_state == "running":
+        marks += PURPLE + "●" + RESET
+    elif outcome == "done":
+        marks += GREEN + "✓" + RESET
+    return marks
+
+
+def thread_title(thread):
+    return thread.get("pin_label") or thread.get("pane_title") or thread.get("title") or thread.get("window_name") or "(untitled)"
+
+
+def sort_key(thread):
+    return (not thread.get("pinned"), -(thread.get("last_activity_at") or 0))
+
+
+def command_list(arguments):
+    threads = sorted(all_threads(), key=sort_key)
+    if "--json" in arguments:
+        json.dump(threads, sys.stdout, indent=1)
+        print()
+        return
+    for thread in threads:
+        visible_marks = re.sub(r"\033\[[0-9;]*m", "", thread_marks(thread))
+        padding = " " * max(0, 4 - len(visible_marks))
+        print(f"{thread['session_id'][:8]}  {thread_marks(thread)}{padding} {format_age(thread.get('last_activity_at')):>4}  "
+              f"{(thread.get('live_state') or '?'):<7}  {DIM}{shorten_home(thread.get('cwd')):<40}{RESET}  {thread_title(thread)}")
+
+
+def recent_prompts(transcript_path, limit=5):
+    """Last few user-typed prompts from a transcript's tail (local preview only)."""
+    prompts = []
+    try:
+        with open(transcript_path, "rb") as transcript:
+            transcript.seek(0, os.SEEK_END)
+            size = transcript.tell()
+            transcript.seek(max(0, size - 4 * TRANSCRIPT_CHUNK_BYTES))
+            lines = transcript.read().splitlines()[1 if size > 4 * TRANSCRIPT_CHUNK_BYTES else 0:]
+    except OSError:
+        return prompts
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = " ".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
+        if not isinstance(content, str) or not content.strip() or content.lstrip().startswith("<"):
+            continue
+        prompts.append(" ".join(content.split())[:200])
+        if len(prompts) >= limit:
+            break
+    return list(reversed(prompts))
+
+
+def command_show(arguments):
+    session_id, _ = resolve_target(arguments[0] if arguments else "")
+    thread = load_thread(session_id) or {"session_id": session_id}
+    print(f"{thread_marks(thread)} {thread_title(thread)}")
+    print(f"{DIM}{session_id}{RESET}")
+    detail_rows = [
+        ("dir", shorten_home(thread.get("cwd"))),
+        ("branch", thread.get("git_branch")),
+        ("state", thread.get("live_state")),
+        ("outcome", " ".join(filter(None, [thread.get("outcome"), thread.get("outcome_detail")]))),
+        ("active", (lambda age: "just now" if age == "now" else f"{age} ago")(format_age(thread.get("last_activity_at")))
+                   if thread.get("last_activity_at") else None),
+        ("started", format_clock(thread["started_at"], True) if thread.get("started_at") else None),
+        ("snoozed", format_clock(thread["snoozed_until"], True) if (thread.get("snoozed_until") or 0) > now_epoch() else None),
+        ("settled", f"{thread.get('settled_reason')} {format_age(thread.get('settled_at'))} ago" if thread.get("settled") else None),
+        ("tree key", thread.get("tree_key")),
+    ]
+    for label, value in detail_rows:
+        if value:
+            print(f"  {label:<8} {value}")
+    transcript_path = thread.get("transcript_path")
+    if transcript_path and not os.path.exists(transcript_path):
+        print(f"  {RED}transcript deleted; not resumable{RESET}")
+    elif transcript_path:
+        prompts = recent_prompts(transcript_path)
+        if prompts:
+            print("\nRecent prompts:")
+            for prompt in prompts:
+                print(f"  › {prompt}")
+
+
+def command_set(arguments):
+    if len(arguments) < 2:
+        raise CommandError("usage: claude-threads set <target> key=value ...")
+    session_id, _ = resolve_target(arguments[0])
+    assignments = {}
+    for assignment in arguments[1:]:
+        key, separator, raw_value = assignment.partition("=")
+        if not separator or not key:
+            raise CommandError(f"bad assignment {assignment!r}")
+        try:
+            assignments[key] = json.loads(raw_value)
+        except ValueError:
+            assignments[key] = raw_value
+    thread = update_thread(session_id, lambda thread: thread.update(assignments))
+    if thread is not None:
+        mirror_to_window(session_id, thread)
+        if "snoozed_until" in assignments:
+            recompute_next_wake()
+
+
+# ---------------------------------------------------------------- pin
+
+def resume_flags_for_session(session_id):
+    """Launch flags of the live claude process, carried over like claude-restart-all does."""
+    info = live_claude_processes().get(session_id)
+    if not info:
+        return None
+    process_arguments = subprocess.run(["ps", "-o", "args=", "-p", str(info["pid"])], capture_output=True, text=True).stdout.split()
+    carried_flags = []
+    argument_index = 0
+    while argument_index < len(process_arguments):
+        argument = process_arguments[argument_index]
+        if argument in ("--permission-mode", "--model", "--add-dir", "--agent") and argument_index + 1 < len(process_arguments):
+            carried_flags += [argument, process_arguments[argument_index + 1]]
+            argument_index += 1
+        elif argument in ("--dangerously-skip-permissions", "--chrome", "--verbose"):
+            carried_flags.append(argument)
+        argument_index += 1
+    return " ".join(shlex.quote(flag) for flag in carried_flags)
+
+
+def command_pin(arguments):
+    if not arguments:
+        raise CommandError("usage: claude-threads pin <target> [--label TEXT]")
+    session_id, window_id = resolve_target(arguments[0])
+    label = arguments[arguments.index("--label") + 1] if "--label" in arguments[1:-1] else ""
+    label = re.sub(r"^[^A-Za-z0-9]+", "", label).strip()   # the prompt is pre-filled with the raw title (spinner glyph)
+    window_id = window_id or live_window_of(session_id)
+    tree_key = pane_title = window_name = None
+    if window_id:
+        tree_key = tmux("show", "-wv", "-t", window_id, "@tree_key") or None
+        pane_title = re.sub(r"^[^A-Za-z0-9]+", "", tmux("display", "-p", "-t", window_id, "#{pane_title}") or "")
+        window_name = tmux("display", "-p", "-t", window_id, "#{window_name}")
+    resume_flags = resume_flags_for_session(session_id)
+    process_cwd = (live_claude_processes().get(session_id) or {}).get("cwd")
+
+    def apply_pin(thread):
+        thread["pinned"] = True
+        thread["pinned_at"] = thread.get("pinned_at") or now_epoch()
+        thread["pin_label"] = label or thread.get("pin_label") or pane_title or thread.get("pane_title") or thread.get("title") or window_name
+        if window_id:
+            thread["tree_key"] = tree_key
+            thread.setdefault("tmux_window_id", window_id)
+        if resume_flags is not None:
+            thread["resume_flags"] = resume_flags
+        if process_cwd and not thread.get("cwd"):
+            thread["cwd"] = process_cwd
+
+    thread = update_thread(session_id, apply_pin)
+    mirror_to_window(session_id, thread, window_id)
+    notify(f"Pinned: {thread_title(thread)}")
+
+
+def command_unpin(arguments):
+    session_id, window_id = resolve_target(arguments[0] if arguments else "")
+    thread = update_thread(session_id, lambda thread: thread.update(pinned=False, pinned_at=None))
+    mirror_to_window(session_id, thread, window_id)
+
+
+def command_toggle_pin(arguments):
+    session_id, _ = resolve_target(arguments[0] if arguments else "")
+    if (load_thread(session_id) or {}).get("pinned"):
+        command_unpin(arguments)
+    else:
+        command_pin(arguments[:1])
+
+
+def command_remember_tree_key(arguments):
+    window_id = arguments[0] if arguments else ""
+    session_id = session_for_window(window_id) if window_id else None
+    if not session_id:
+        return
+    tree_key = tmux("show", "-wv", "-t", window_id, "@tree_key") or None
+    update_thread(session_id, lambda thread: thread.update(tree_key=tree_key))
+
+
+def pinned_rows(only_closed=False):
+    rows = []
+    for thread in sorted((thread for thread in all_threads() if thread.get("pinned")), key=lambda thread: thread.get("pinned_at") or 0):
+        session_id = thread["session_id"]
+        is_live = live_window_of(session_id, thread) is not None
+        if only_closed and is_live:
+            continue
+        marker = AMBER + "^" + RESET if is_live else DIM + "↺" + RESET
+        snooze_mark = f" z {format_clock(thread['snoozed_until'])}" if (thread.get("snoozed_until") or 0) > now_epoch() else ""
+        tree_key_mark = f"  [{thread['tree_key']}]" if thread.get("tree_key") else ""
+        rows.append(f"thread:{session_id}\t{marker} {thread_title(thread)}  {DIM}{shorten_home(thread.get('cwd'))}  "
+                    f"{thread.get('git_branch') or ''}{tree_key_mark}{snooze_mark}{RESET}")
+    return rows
+
+
+def command_pinned(arguments):
+    if arguments and arguments[0] == "--rows":
+        for row in pinned_rows(only_closed=arguments[1:2] == ["closed"]):
+            print(row)
+        return
+    rows = pinned_rows()
+    if not rows:
+        notify("No pinned threads (pin one with <prefix>b)")
+        return
+    fzf = subprocess.run(
+        ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2", "--prompt=pinned> ",
+         "--header=enter: open/resume   ctrl-t: unpin   ctrl-e: edit label",
+         "--bind", "ctrl-t:execute-silent(claude-threads unpin {1})+reload(claude-threads pinned --rows)",
+         "--bind", "ctrl-e:execute(printf 'Label: '; read -r new_label </dev/tty; claude-threads set {1} pin_label=\"$new_label\")"
+                   "+reload(claude-threads pinned --rows)",
+         "--preview", "claude-threads show {1}", "--preview-window=right,55%"],
+        input="\n".join(rows) + "\n", capture_output=True, text=True)
+    selection = fzf.stdout.strip()
+    if selection:
+        command_open([selection.split("\t", 1)[0]])
+
+
+def command_open(arguments):
+    if not arguments:
+        raise CommandError("usage: claude-threads open <target> [--session ID]")
+    session_id, _ = resolve_target(arguments[0])
+    tmux_session = arguments[arguments.index("--session") + 1] if "--session" in arguments[1:-1] else None
+    thread = load_thread(session_id)
+    if not thread:
+        raise CommandError(f"unknown thread {session_id}")
+    live_window = live_window_of(session_id, thread)
+    if live_window:
+        tmux("switch-client", "-t", live_window)
+        return
+    transcript_path = thread.get("transcript_path")
+    if transcript_path and not os.path.exists(transcript_path):
+        raise CommandError("transcript was deleted; this thread can't be resumed")
+
+    thread_cwd = thread.get("cwd") or os.path.expanduser("~")
+    launch_directory = thread_cwd
+    while launch_directory and launch_directory != "/" and not os.path.isdir(launch_directory):
+        launch_directory = os.path.dirname(launch_directory)
+    recovery_hint = ""
+    if launch_directory != thread_cwd:
+        notify(f"claude-threads: {thread_cwd} is missing; resuming from {launch_directory}")
+        recovery_hint = (f"echo {shlex.quote(f'claude-threads: {thread_cwd} is gone (removed worktree?). Recreate it, e.g. '
+                                             f'git worktree add {thread_cwd} {thread.get("git_branch") or "<branch>"}, '
+                                             f'then: cd {thread_cwd} && claude --resume {session_id}')}; ")
+    resume_flags = thread.get("resume_flags") or ""
+    resume_command = (f"claude {resume_flags + ' ' if resume_flags else ''}--resume {session_id} || {{ {recovery_hint}true; }}; "
+                      f"exec \"$SHELL\" -l")
+    window_title = thread.get("pin_label") or thread.get("window_name") or "claude"
+    new_window_arguments = ["new-window", "-P", "-F", "#{window_id}", "-n", window_title[:40], "-c", launch_directory]
+    if tmux_session:
+        new_window_arguments[1:1] = ["-t", f"{tmux_session}:"]
+    new_window_id = tmux(*new_window_arguments, resume_command)
+    if not new_window_id:
+        raise CommandError("tmux new-window failed")
+    update_thread(session_id, lambda thread: thread.update(tmux_window_id=new_window_id))
+    mirror_to_window(session_id, load_thread(session_id), new_window_id)
+    tree_key = thread.get("tree_key")
+    if tree_key:
+        keys_in_use = (tmux("list-windows", "-a", "-F", "#{@tree_key}") or "").splitlines()
+        if tree_key in keys_in_use:
+            notify(f"claude-threads: tree key [{tree_key}] already in use; not restored")
+        else:
+            tmux("set", "-w", "-t", new_window_id, "@tree_key", tree_key)
+    tmux("switch-client", "-t", new_window_id)
+
+
+# ---------------------------------------------------------------- snooze
+
+WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+DURATION_UNITS = {"m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+                  "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+                  "d": 86400, "day": 86400, "days": 86400,
+                  "w": 604800, "wk": 604800, "wks": 604800, "week": 604800, "weeks": 604800}
+
+
+def parse_wake_time(specification, current_time=None):
+    """Human snooze spec -> epoch seconds, or None if unparseable."""
+    current_time = current_time or datetime.datetime.now()
+    spec = " ".join(specification.lower().split())
+    if re.fullmatch(r"\d+", spec):
+        return int(current_time.timestamp()) + int(spec) * 60
+    duration_parts = re.findall(r"(\d+)\s*([a-z]+)", spec)
+    if duration_parts and re.fullmatch(r"(\s*\d+\s*[a-z]+)+", spec):
+        if all(unit in DURATION_UNITS for _, unit in duration_parts):
+            total_seconds = sum(int(amount) * DURATION_UNITS[unit] for amount, unit in duration_parts)
+            return int(current_time.timestamp()) + total_seconds if total_seconds > 0 else None
+    day_match = re.fullmatch(r"(today|tonight|tomorrow|tmrw|mon|tue|wed|thu|fri|sat|sun)[a-z]*(?: (?:at )?(.*))?", spec)
+    day_word, time_part = (day_match.group(1), day_match.group(2) or "") if day_match else ("", spec)
+    if not time_part:
+        if day_word == "tonight":
+            hour, minute = 19, 0
+        elif day_word in ("", "today"):
+            return None
+        else:
+            hour, minute = MORNING_HOUR, 0
+    else:
+        time_match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", time_part)
+        if not time_match:
+            return None
+        hour, minute, meridiem = int(time_match.group(1)), int(time_match.group(2) or 0), time_match.group(3)
+        if meridiem:
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if meridiem == "pm" else 0)
+        elif day_word == "tonight" and hour < 12:
+            hour += 12
+        if hour > 23 or minute > 59:
+            return None
+    day_offset = 0
+    if day_word in ("tomorrow", "tmrw"):
+        day_offset = 1
+    elif day_word in WEEKDAY_NAMES:
+        day_offset = (WEEKDAY_NAMES.index(day_word) - current_time.weekday()) % 7 or 7
+    wake_time = (current_time + datetime.timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if wake_time <= current_time:
+        if day_word:
+            return None   # "today 9am" / "tonight" already past
+        wake_time += datetime.timedelta(days=1)   # bare time rolls to tomorrow
+    return int(wake_time.timestamp())
+
+
+def recompute_next_wake():
+    pending_wakes = [thread["snoozed_until"] for thread in all_threads() if isinstance(thread.get("snoozed_until"), (int, float)) and thread["snoozed_until"] > 0]
+    if pending_wakes:
+        temporary_path = f"{NEXT_WAKE_FILE}.tmp.{os.getpid()}"
+        with open(temporary_path, "w") as next_wake_handle:
+            next_wake_handle.write(f"{int(min(pending_wakes))}\n")
+        os.replace(temporary_path, NEXT_WAKE_FILE)
+    else:
+        try:
+            os.remove(NEXT_WAKE_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def command_snooze(arguments):
+    if not arguments:
+        raise CommandError("usage: claude-threads snooze <target> <when...>")
+    session_id, window_id = resolve_target(arguments[0])
+    specification = " ".join(arguments[1:]).strip()
+    if specification.lower() in ("", "wake", "off", "0", "none"):
+        wake_thread(session_id, "manual")
+        notify("Woke thread")
+        return
+    wake_epoch = parse_wake_time(specification)
+    if wake_epoch is None:
+        raise CommandError(f"Can't parse '{specification}' (try 30m, 2h, 14:30, tomorrow 9am, mon)")
+
+    def apply_snooze(thread):
+        thread.update(snoozed_until=wake_epoch, snoozed_at=now_epoch(), snooze_news=None)
+        if thread.get("settled"):
+            thread.update(settled=False, settled_at=None, settled_reason=None, unsettled_at=now_epoch())
+
+    thread = update_thread(session_id, apply_snooze)
+    mirror_to_window(session_id, thread, window_id)
+    recompute_next_wake()
+    notify(f"Snoozed until {format_clock(wake_epoch, True)}")
+
+
+def wake_thread(session_id, wake_reason):
+    previous = load_thread(session_id) or {}
+    snooze_news = previous.get("snooze_news")
+    thread = update_thread(session_id, lambda thread: thread.update(
+        snoozed_until=None, snooze_news=None, snooze_woke_at=now_epoch(),
+        snooze_woke_reason=wake_reason, snooze_woke_with_news=snooze_news))
+    window_id = live_window_of(session_id, thread)
+    mirror_to_window(session_id, thread, window_id)
+    if window_id and wake_reason == "timer":
+        # Snooze means "remind me later": bring the window back as your turn unless Claude is mid-turn.
+        if thread.get("live_state") != "running":
+            tmux("set", "-w", "-t", window_id, "@claude_waiting", "1", ";",
+                 "set", "-w", "-t", window_id, "@claude_outcome", thread.get("outcome") or "done")
+        is_watched, window_name = (tmux("display", "-p", "-t", window_id, "#{&&:#{window_active},#{session_attached}}\t#{window_name}") or "0\t").split("\t", 1)
+        if is_watched != "1":
+            suffix = {"needs_approval": "needs input while snoozed", "done": "done while snoozed",
+                      "failed": "failed while snoozed"}.get(snooze_news, "snooze over")
+            speak(f"{thread.get('pin_label') or window_name or 'Claude'} {suffix}")
+    recompute_next_wake()
+
+
+def command_wake(arguments):
+    session_id, _ = resolve_target(arguments[0] if arguments else "")
+    wake_thread(session_id, "manual")
+
+
+def command_wake_due(arguments):
+    os.makedirs(STATE_ROOT, exist_ok=True)
+    if not acquire_lock(SWEEP_LOCK_DIR + ".wake", timeout_seconds=0, steal_when_stale=False):
+        return
+    try:
+        current_time = now_epoch()
+        for thread in all_threads():
+            snoozed_until = thread.get("snoozed_until")
+            if isinstance(snoozed_until, (int, float)) and 0 < snoozed_until <= current_time:
+                wake_thread(thread["session_id"], "timer")
+        recompute_next_wake()
+    finally:
+        release_lock(SWEEP_LOCK_DIR + ".wake")
+
+
+# ---------------------------------------------------------------- settle
+
+def command_settle(arguments):
+    should_kill_window = "--kill" in arguments
+    positional_arguments = [argument for argument in arguments if argument != "--kill"]
+    session_id, window_id = resolve_target(positional_arguments[0] if positional_arguments else "")
+
+    def apply_settle(thread):
+        thread.update(settled=True, settled_at=thread.get("settled_at") or now_epoch(),
+                      settled_reason=thread.get("settled_reason") or "manual", snoozed_until=None, snooze_news=None)
+
+    thread = update_thread(session_id, apply_settle)   # pins are kept: settling only leaves active views
+    window_id = window_id or live_window_of(session_id, thread)
+    recompute_next_wake()
+    if should_kill_window and window_id:
+        tmux("kill-window", "-t", window_id)
+        return
+    mirror_to_window(session_id, thread, window_id)
+    notify(f"Settled: {thread_title(thread)}")
+
+
+def command_unsettle(arguments):
+    session_id, window_id = resolve_target(arguments[0] if arguments else "")
+
+    def apply_unsettle(thread):
+        if thread.get("settled"):
+            thread.update(settled=False, settled_at=None, settled_reason=None, unsettled_at=now_epoch())
+
+    thread = update_thread(session_id, apply_unsettle)
+    mirror_to_window(session_id, thread, window_id)
+
+
+# ---------------------------------------------------------------- sweep: backfill + reconcile + auto-settle
+
+def iso_to_epoch(timestamp):
+    try:
+        return int(datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp())
+    except (AttributeError, ValueError):
+        return None
+
+
+def parse_json_lines(blob, skip_first_partial_line):
+    for line in blob.split(b"\n")[1 if skip_first_partial_line else 0:]:
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def parse_transcript(transcript_path, file_size):
+    """Metadata from a transcript's head and tail: cwd, branch, start/last activity, title, final outcome."""
+    found = {}
+    with open(transcript_path, "rb") as transcript:
+        for entry in parse_json_lines(transcript.read(TRANSCRIPT_CHUNK_BYTES), False):
+            if entry.get("timestamp") and entry.get("cwd"):
+                found.update(started_at=iso_to_epoch(entry["timestamp"]), cwd=entry["cwd"], git_branch=entry.get("gitBranch"))
+                break
+        transcript.seek(max(0, file_size - TRANSCRIPT_CHUNK_BYTES))
+        tail_entries = list(parse_json_lines(transcript.read(), file_size > TRANSCRIPT_CHUNK_BYTES))
+    for entry in reversed(tail_entries):
+        entry_type = entry.get("type")
+        if "title" not in found and entry_type == "ai-title" and entry.get("aiTitle"):
+            found["title"] = entry["aiTitle"]
+        if "last_activity_at" in found or entry_type not in ("user", "assistant") or entry.get("isSidechain"):
+            continue
+        found["last_activity_at"] = iso_to_epoch(entry.get("timestamp"))
+        if entry_type == "assistant":
+            found["outcome"], found["outcome_detail"] = ("failed", entry.get("error") or "unknown") if entry.get("isApiErrorMessage") else ("done", None)
+        else:
+            content = (entry.get("message") or {}).get("content")
+            texts = [content] if isinstance(content, str) else [block.get("text", "") for block in content or [] if isinstance(block, dict)]
+            if not any("[Request interrupted by user" in text for text in texts):
+                found["outcome"], found["outcome_detail"] = "needs_approval", "unanswered"
+    return found
+
+
+def command_sweep(arguments):
+    os.makedirs(LOCKS_DIR, exist_ok=True)
+    if arguments[:1] == ["--if-older-than"] and len(arguments) > 1:
+        try:
+            if now_epoch() - os.stat(SWEEP_STAMP_FILE).st_mtime < float(arguments[1]):
+                return
+        except FileNotFoundError:
+            pass
+    try:
+        if time.time() - os.stat(SWEEP_LOCK_DIR).st_mtime > 120:
+            os.rmdir(SWEEP_LOCK_DIR)
+    except OSError:
+        pass
+    if not acquire_lock(SWEEP_LOCK_DIR, timeout_seconds=0, steal_when_stale=False):
+        return
+    try:
+        sweep_registry()
+        with open(SWEEP_STAMP_FILE, "a"):
+            pass
+        os.utime(SWEEP_STAMP_FILE)
+    finally:
+        release_lock(SWEEP_LOCK_DIR)
+
+
+def sweep_registry():
+    current_time = now_epoch()
+    settle_after_seconds = SETTLE_DAYS * 86400
+    live_sessions = live_claude_processes()
+
+    # 1. Backfill / refresh from transcripts (top-level only; subagent transcripts live one level deeper).
+    for transcript_path in glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", "*.jsonl")):
+        session_id = os.path.basename(transcript_path)[:-len(".jsonl")]
+        if not SESSION_ID_PATTERN.match(session_id):
+            continue
+        try:
+            transcript_stat = os.stat(transcript_path)
+        except OSError:
+            continue
+        existing_thread = load_thread(session_id)
+        if existing_thread and existing_thread.get("transcript_mtime") == int(transcript_stat.st_mtime):
+            continue
+        try:
+            parsed = parse_transcript(transcript_path, transcript_stat.st_size)
+        except OSError:
+            continue
+        if not parsed.get("cwd") and not existing_thread:
+            continue   # metadata-only stub, nothing to resume
+
+        def merge_backfill(thread, parsed=parsed, transcript_stat=transcript_stat, transcript_path=transcript_path, session_id=session_id):
+            is_new_thread = "live_state" not in thread
+            thread.setdefault("transcript_path", transcript_path)
+            for key in ("cwd", "git_branch", "started_at"):
+                if not thread.get(key) and parsed.get(key) is not None:
+                    thread[key] = parsed[key]
+            thread.setdefault("started_at", int(getattr(transcript_stat, "st_birthtime", transcript_stat.st_mtime)))
+            thread["last_activity_at"] = max(thread.get("last_activity_at") or 0, parsed.get("last_activity_at") or int(transcript_stat.st_mtime))
+            if parsed.get("title"):
+                thread["title"] = parsed["title"]
+            thread["transcript_mtime"] = int(transcript_stat.st_mtime)
+            if is_new_thread:
+                thread.update(source="backfill", live_state="idle" if session_id in live_sessions else "closed")
+                if parsed.get("outcome") and "outcome" not in thread:
+                    thread.update(outcome=parsed["outcome"], outcome_detail=parsed.get("outcome_detail"))
+
+        update_thread(session_id, merge_backfill)
+
+    # 2. Reconcile liveness and auto-settle.
+    windows_to_clear, windows_to_mirror = [], []
+    for thread_file_path in glob.glob(os.path.join(THREADS_DIR, "*.json")):
+        session_id = os.path.basename(thread_file_path)[:-len(".json")]
+        if not SESSION_ID_PATTERN.match(session_id):
+            continue
+
+        def reconcile(thread, session_id=session_id):
+            live_info = live_sessions.get(session_id)
+            was_settled = bool(thread.get("settled"))
+            if live_info is not None:
+                tmux_location = live_info.get("tmux") or ""
+                if "." in tmux_location:
+                    thread["tmux_window_id"], thread["tmux_pane"] = tmux_location.split(":", 1)[-1].split(".", 1)
+                if thread.get("live_state") == "closed":
+                    thread["live_state"] = "idle"
+            elif thread.get("live_state") != "closed" and current_time - (thread.get("last_activity_at") or 0) > CLOSE_GRACE_SECONDS:
+                thread.update(live_state="closed", closed_at=current_time)
+                if thread.get("tmux_window_id"):
+                    windows_to_clear.append((thread["tmux_window_id"], session_id))
+            transcript_path = thread.get("transcript_path")
+            thread["transcript_missing"] = bool(transcript_path) and not os.path.exists(transcript_path)
+            snoozed_until = thread.get("snoozed_until") or 0
+            reference_time = max(thread.get("last_activity_at") or 0, thread.get("unsettled_at") or 0,
+                                 thread.get("snooze_woke_at") or 0, snoozed_until)
+            if (not was_settled and not thread.get("pinned") and thread.get("live_state") != "running"
+                    and snoozed_until <= current_time and current_time - reference_time > settle_after_seconds):
+                thread.update(settled=True, settled_at=current_time, settled_reason="auto_inactive")
+                if live_info is not None and "." in (live_info.get("tmux") or ""):
+                    windows_to_mirror.append((session_id, thread["tmux_window_id"]))
+
+        update_thread(session_id, reconcile)
+
+    for window_id, session_id in windows_to_clear:
+        # Claude died without SessionEnd: drop markers if the window still claims this session.
+        if tmux("show", "-wv", "-t", window_id, "@claude_session_id") == session_id:
+            commands = []
+            for option_name in ("@claude_session_id", "@claude_running", "@claude_waiting", "@claude_outcome", "@claude_pending_approval_tool",
+                                "@claude_pinned", "@claude_snoozed", "@claude_snoozed_label", "@claude_snooze_news", "@claude_settled"):
+                commands += ["set", "-wu", "-t", window_id, option_name, ";"]
+            tmux(*commands[:-1])
+    for session_id, window_id in windows_to_mirror:
+        # Window comes from Claude's own pid file, so this also tags windows that predate the hook.
+        mirror_to_window(session_id, window_id=window_id)
+    recompute_next_wake()
+
+
+# ---------------------------------------------------------------- dispatch
+
+COMMANDS = {
+    "list": command_list, "show": command_show, "set": command_set,
+    "pin": command_pin, "unpin": command_unpin, "toggle-pin": command_toggle_pin, "pinned": command_pinned,
+    "open": command_open, "remember-tree-key": command_remember_tree_key,
+    "snooze": command_snooze, "wake": command_wake, "wake-due": command_wake_due,
+    "settle": command_settle, "unsettle": command_unsettle, "sweep": command_sweep,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help") or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help", "help") else 2
+    os.makedirs(LOCKS_DIR, exist_ok=True)
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except CommandError as error:
+        notify(f"claude-threads: {error}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

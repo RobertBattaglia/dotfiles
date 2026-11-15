@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Called from tmux status-right every status-interval (2s); prints nothing.
+# Fast path is one file read and an integer compare; python only runs when a snooze has expired.
+next_wake_file="${XDG_STATE_HOME:-$HOME/.local/state}/claude-threads/snooze_next_wake_at"
+[[ -r "$next_wake_file" ]] || exit 0
+read -r next_wake_at <"$next_wake_file"
+[[ "$next_wake_at" =~ ^[0-9]+$ ]] || exit 0
+(( ${EPOCHSECONDS:-$(date +%s)} >= next_wake_at )) || exit 0
+"$HOME/.local/bin/claude-threads" wake-due >/dev/null 2>&1
+exit 0

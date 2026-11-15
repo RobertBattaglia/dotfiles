@@ -1,44 +1,98 @@
 #!/usr/bin/env bash
-# Fuzzy finder for tmux windows across all sessions (bound to <prefix>g in tmux). Searches the window name,
-# the active pane's directory, and its pane title (e.g. Claude Code's task summary).
+# Fuzzy finder for tmux windows across all sessions (bound to <prefix>Space in tmux). Searches the window name,
+# the foreground process's PID, the active pane's directory, and its pane title (e.g. Claude Code's task summary).
 # Enter on a match jumps to that window. If nothing matches, Enter creates a new window named
 # after the typed query in the current session.
-# Claude Code windows are marked: red = waiting for input, purple = agent running.
+# Claude Code windows are marked: ◆ amber = needs approval, ✗ red = failed, ✓ green = done, ● purple = running,
+# z gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
+# was closed (↺; Enter resumes them in a new window via claude-threads open). ctrl-t toggles a pin.
 #
 # Usage: tmux-windowizer [SESSION_ID] [START_DIRECTORY]
+#        tmux-windowizer --rows            (print the list; used by fzf reload)
 #   (tmux.conf passes the current session and pane path; both are optional)
 set -uo pipefail
 
+list_only=0
+if [[ "${1:-}" == --rows ]]; then list_only=1; shift; fi
 current_session_id=${1:-}
 start_directory=${2:-$PWD}
 
-RED_DOT=$'\e[38;2;185;28;28m●\e[0m'
-PURPLE_DOT=$'\e[38;2;124;58;237m●\e[0m'
+RUNNING_MARK=$'\e[38;2;124;58;237m●\e[0m'
+APPROVAL_MARK=$'\e[38;2;245;158;11m◆\e[0m'
+DONE_MARK=$'\e[38;2;21;128;61m✓\e[0m'
+FAILED_MARK=$'\e[38;2;185;28;28m✗\e[0m'
+SNOOZED_MARK=$'\e[38;2;156;163;175mz\e[0m'
+SETTLED_MARK=$'\e[2m·\e[0m'
+PIN_MARK=$'\e[38;2;245;158;11m^\e[0m'
 
 DIM=$'\e[2m' RESET=$'\e[0m'
 
-# One line per window: "window_id<TAB><marker> session:index  name  ~/dir  title"
+# One line per window: "sort_group<TAB>window_id<TAB><pin><marker> session:index  name  pid  ~/dir  title"
+# sort_group 0 = pinned window, 2 = other windows (1 = pinned closed threads, added in all_rows).
+# pid is the active pane's foreground process (e.g. Claude, matching ~/.claude/sessions/<pid>.json),
+# found as its terminal's foreground process-group leader, stepping through shell wrappers (like
+# `zsh -c "claude ..."` from claude-restart-all) to the program they launched.
 # Pane titles are dropped when they are the shell's default "user@host:dir" or just repeat the window name.
 list_windows() {
-  tmux list-windows -a -F $'#{window_id}\t#{?@claude_waiting,waiting,#{?@claude_running,running,}}\t#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{?#{m:*@#{host_short}:*,#{pane_title}},,#{?#{==:#{pane_title},#{window_name}},,#{pane_title}}}' |
-    awk -F'\t' -v red="$RED_DOT" -v purple="$PURPLE_DOT" -v home="$HOME" -v dim="$DIM" -v reset="$RESET" '{
-      marker = ($2 == "waiting") ? red : ($2 == "running") ? purple : " "
+  awk -F'\t' -v running_mark="$RUNNING_MARK" -v approval_mark="$APPROVAL_MARK" -v done_mark="$DONE_MARK" \
+    -v failed_mark="$FAILED_MARK" -v snoozed_mark="$SNOOZED_MARK" -v settled_mark="$SETTLED_MARK" -v pin_mark="$PIN_MARK" \
+    -v home="$HOME" -v dim="$DIM" -v reset="$RESET" '
+    FNR == NR {
+      # ps columns: pid ppid pgid tpgid tty comm -- keep foreground-group members per terminal
+      split($0, ps_fields, " ")
+      if (ps_fields[3] != ps_fields[4]) next
+      if (ps_fields[1] == ps_fields[3]) leader_of_tty["/dev/" ps_fields[5]] = ps_fields[1]
+      child_of_pid[ps_fields[2]] = ps_fields[1]
+      command_of_pid[ps_fields[1]] = ps_fields[6]
+      next
+    }
+    FNR == 1 {
+      # Start at the foreground group leader; step through shell wrappers to the program they launched.
+      for (tty in leader_of_tty) {
+        pid = leader_of_tty[tty]
+        while (command_of_pid[pid] ~ /^-?(zsh|bash|sh|fish)$/ && (pid in child_of_pid)) pid = child_of_pid[pid]
+        foreground_pid[tty] = pid
+      }
+    }
+    {
+      marker = ($2 == "approval") ? approval_mark : ($2 == "settled") ? settled_mark : ($2 == "snoozed") ? snoozed_mark \
+             : ($2 == "failed") ? failed_mark : ($2 == "done") ? done_mark : ($2 == "running") ? running_mark : " "
+      pin = ($8 == "1") ? pin_mark : " "
       directory = $5
       if (index(directory, home) == 1) directory = "~" substr(directory, length(home) + 1)
       title = ($6 == "") ? "" : "  " $6
-      printf "%s\t%s %s  %s  %s%s%s%s\n", $1, marker, $3, $4, dim, directory, reset, title
-    }'
+      pid = ($7 in foreground_pid) ? foreground_pid[$7] : "?"
+      printf "%s\t%s\t%s%s %s  %s  %s%s  %s%s%s\n", ($8 == "1") ? 0 : 2, $1, pin, marker, $3, $4, dim, pid, directory, reset, title
+    }' \
+    <(ps -ax -o pid=,ppid=,pgid=,tpgid=,tty=,comm=) \
+    <(tmux list-windows -a -F $'#{window_id}\t#{?#{==:#{@claude_outcome},needs_approval},approval,#{?@claude_settled,settled,#{?@claude_snoozed,snoozed,#{?#{==:#{@claude_outcome},failed},failed,#{?#{==:#{@claude_outcome},done},done,#{?@claude_running,running,}}}}}}\t#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{?#{m:*@#{host_short}:*,#{pane_title}},,#{?#{==:#{pane_title},#{window_name}},,#{pane_title}}}\t#{pane_tty}\t#{?@claude_pinned,1,}')
 }
 
-fzf_output=$(list_windows | fzf --ansi --print-query --delimiter=$'\t' --with-nth=2 \
-  --prompt="window> " \
-  --preview='tmux capture-pane -ep -t {1}' --preview-window=right,60%)
+# Windows plus pinned Claude threads whose window was closed, pinned first (sort -s keeps tmux order within a group).
+all_rows() {
+  {
+    list_windows
+    claude-threads pinned --rows closed 2>/dev/null | sed $'s/^/1\t/'
+  } | sort -s -t$'\t' -k1,1n | cut -f2-
+}
+
+if (( list_only )); then all_rows; exit 0; fi
+
+fzf_output=$(all_rows | fzf --ansi --print-query --delimiter=$'\t' --with-nth=2 \
+  --prompt="window> " --header="enter: jump/resume   ctrl-t: pin/unpin" \
+  --bind "ctrl-t:execute-silent(claude-threads toggle-pin {1})+reload(tmux-windowizer --rows)" \
+  --preview='case {1} in thread:*) claude-threads show {1} ;; *) tmux capture-pane -ep -t {1} ;; esac' \
+  --preview-window=right,60%)
 
 query=$(sed -n 1p <<<"$fzf_output")
 selected_line=$(sed -n 2p <<<"$fzf_output")
 
 if [[ -n "$selected_line" ]]; then
-  tmux switch-client -t "${selected_line%%$'\t'*}"
+  selected_id=${selected_line%%$'\t'*}
+  case "$selected_id" in
+    thread:*) claude-threads open "$selected_id" ${current_session_id:+--session "$current_session_id"} ;;
+    *)        tmux switch-client -t "$selected_id" ;;
+  esac
 elif [[ -n "$query" ]]; then
   tmux new-window ${current_session_id:+-t "$current_session_id:"} -n "$query" -c "$start_directory"
 fi

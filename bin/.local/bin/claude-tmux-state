@@ -1,45 +1,233 @@
 #!/usr/bin/env bash
-# Called by Claude Code hooks to update this tmux window's Claude status flags
-# (@claude_running = purple, @claude_waiting = red in tmux.conf), and to announce via
-# text-to-speech when a running Claude stops to wait on you or finishes.
+# Claude Code hook helper. Reads the hook JSON on stdin and:
+#   1. records the session in the thread registry (claude-threads; one JSON file per session_id)
+#   2. mirrors the thread's state into tmux window options that tmux.conf renders:
+#        @claude_running                  purple  Claude is working
+#        @claude_outcome=needs_approval   amber   permission prompt / question / plan review
+#        @claude_outcome=done             green   turn finished
+#        @claude_outcome=failed           red     turn ended by an API error (StopFailure)
+#        @claude_snoozed / @claude_settled / @claude_pinned  (owned by claude-threads, re-mirrored here)
+#      @claude_waiting stays the boolean "your turn" flag (approval, done, or failed).
+#   3. announces running -> stopped transitions via claude-tmux-speak, unless you're looking at the window,
+#      the thread is settled, or it is snoozed (approval prompts still break through a snooze).
 #
-# Usage: claude-tmux-state running|waiting|idle|clear
-#   running  prompt submitted / tool activity     -> purple
-#   waiting  Notification (needs input)           -> red, says "<window> needs input" if it was running
-#   idle     Stop (turn finished)                 -> red (your turn), says "<window> done" if it was running
-#   clear    SessionEnd                           -> no colour, silent
-#
-# Set CLAUDE_TMUX_SPEAK=0 to silence announcements.
-# Set CLAUDE_TMUX_SPEAK_VOLUME (afplay volume, 1 = normal, default 0.6) to adjust loudness without
-# touching the system volume.
+# Usage: claude-tmux-state [running|waiting|idle|clear]
+#   The argument is only a fallback for when stdin carries no hook JSON; the event comes from hook_event_name.
 set -uo pipefail
 
-[[ -n "${TMUX_PANE:-}" ]] || exit 0
-new_state=${1:-}
+legacy_mode=${1:-}
+state_root="${XDG_STATE_HOME:-$HOME/.local/state}/claude-threads"
+threads_dir="$state_root/threads"
+locks_dir="$threads_dir/.locks"
+field_separator=$'\x1f'   # non-whitespace IFS so `read` keeps empty fields
+now=${EPOCHSECONDS:-$(date +%s)}
 
-# Window is "being looked at" when it is the active window of an attached session.
-{
-  IFS= read -r was_running
-  IFS= read -r is_watched
-  IFS= read -r automatic_rename
-  IFS= read -r window_name
-  IFS= read -r pane_title
-} < <(tmux display -p -t "$TMUX_PANE" \
-  $'#{?@claude_running,1,0}\n#{&&:#{window_active},#{session_attached}}\n#{automatic-rename}\n#{window_name}\n#{pane_title}' 2>/dev/null)
+hook_json=""
+[[ -t 0 ]] || hook_json=$(cat)
 
-case "$new_state" in
-  running) tmux set -wu -t "$TMUX_PANE" @claude_waiting \; set -w -t "$TMUX_PANE" @claude_running 1 ;;
-  waiting) tmux set -w -t "$TMUX_PANE" @claude_waiting 1 \; set -wu -t "$TMUX_PANE" @claude_running ;;
-  idle)    tmux set -w -t "$TMUX_PANE" @claude_waiting 1 \; set -wu -t "$TMUX_PANE" @claude_running ;;
-  clear)   tmux set -wu -t "$TMUX_PANE" @claude_waiting \; set -wu -t "$TMUX_PANE" @claude_running ;;
-  *)       echo "usage: $(basename "$0") running|waiting|idle|clear" >&2; exit 2 ;;
+hook_event="" session_id="" hook_cwd="" transcript_path="" notification_type="" tool_name="" stop_error=""
+is_interrupt=false has_pending_background_work=false
+if [[ -n "$hook_json" ]]; then
+  IFS=$field_separator read -r hook_event session_id hook_cwd transcript_path notification_type tool_name stop_error \
+    is_interrupt has_pending_background_work < <(
+    jq -r --arg sep "$field_separator" '[
+        .hook_event_name // "", .session_id // "", .cwd // "", .transcript_path // "",
+        .notification_type // "", .tool_name // "",
+        (if .hook_event_name == "StopFailure" then (.error // "unknown" | tostring) else "" end),
+        (.is_interrupt // false | tostring),
+        (((.background_tasks // []) + (.session_crons // [])) | length > 0 | tostring)
+      ] | join($sep)' <<<"$hook_json" 2>/dev/null)
+fi
+
+if [[ -z "$hook_event" ]]; then
+  case "$legacy_mode" in
+    running) hook_event=UserPromptSubmit ;;
+    waiting) hook_event=Notification notification_type=permission_prompt ;;
+    idle)    hook_event=Stop ;;
+    clear)   hook_event=SessionEnd ;;
+    *) echo "usage: $(basename "$0") [running|waiting|idle|clear]  (hook JSON on stdin preferred)" >&2; exit 2 ;;
+  esac
+fi
+
+was_running=0 is_watched=0 automatic_rename=0 window_name="" pane_title="" pending_approval_tool=""
+window_id="" window_is_settled=0 window_is_snoozed=0
+if [[ -n "${TMUX_PANE:-}" ]]; then
+  # Pane titles are dropped when they are the shell's default "user@host:dir".
+  {
+    IFS= read -r was_running; IFS= read -r is_watched; IFS= read -r automatic_rename
+    IFS= read -r window_name; IFS= read -r pane_title; IFS= read -r pending_approval_tool
+    IFS= read -r window_id; IFS= read -r window_is_settled; IFS= read -r window_is_snoozed
+  } < <(tmux display -p -t "$TMUX_PANE" "$(printf '%s\n' \
+      '#{?@claude_running,1,0}' '#{&&:#{window_active},#{session_attached}}' '#{automatic-rename}' \
+      '#{window_name}' '#{?#{m:*@#{host_short}:*,#{pane_title}},,#{pane_title}}' '#{@claude_pending_approval_tool}' \
+      '#{window_id}' '#{?@claude_settled,1,0}' '#{?@claude_snoozed,1,0}')" 2>/dev/null)
+fi
+
+# ---- Derive the transition: running | needs_approval | done | failed | interrupted | closed | registered | noop
+transition=noop outcome_detail="" approval_tool=""
+running_unless_other_approval_pending() {   # a parallel tool finishing must not wipe a pending approval
+  if [[ -z "$pending_approval_tool" || "$tool_name" == "$pending_approval_tool" ]]; then transition=running; fi
+}
+case "$hook_event" in
+  SessionStart)     transition=registered ;;
+  UserPromptSubmit) transition=running ;;
+  PreToolUse)
+    case "$tool_name" in
+      AskUserQuestion) transition=needs_approval outcome_detail=question    approval_tool=$tool_name ;;
+      ExitPlanMode)    transition=needs_approval outcome_detail=plan_review approval_tool=$tool_name ;;
+      *) [[ -z "$pending_approval_tool" ]] && transition=running ;;
+    esac ;;
+  PermissionRequest) transition=needs_approval outcome_detail="permission:$tool_name" approval_tool=$tool_name ;;
+  Notification)
+    case "$notification_type" in
+      permission_prompt|worker_permission_prompt)   # delayed backup for PermissionRequest
+        [[ -z "$pending_approval_tool" ]] && transition=needs_approval outcome_detail=permission ;;
+      elicitation_dialog|elicitation_url_dialog) transition=needs_approval outcome_detail=mcp_input ;;
+      *) transition=noop ;;   # idle_prompt fires ~60s after Stop and must not relabel done/failed
+    esac ;;
+  PostToolUse) running_unless_other_approval_pending ;;
+  PostToolUseFailure)
+    if [[ "$is_interrupt" == true ]]; then transition=interrupted; else running_unless_other_approval_pending; fi ;;
+  Stop)        transition=done; [[ "$has_pending_background_work" == true ]] && outcome_detail=background_pending ;;
+  StopFailure) transition=failed outcome_detail=${stop_error:-unknown} ;;
+  SessionEnd)  transition=closed ;;
 esac
 
-[[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && "$was_running" == 1 && "$is_watched" != 1 ]] || exit 0
-case "$new_state" in
-  waiting) suffix="needs input" ;;
-  idle)    suffix="done" ;;
-  *)       exit 0 ;;
+# Registry patch: live_state + outcome ("__keep__" leaves outcome fields untouched).
+case "$transition" in
+  running)        registry_live_state=running registry_outcome="" ;;
+  needs_approval) registry_live_state=waiting registry_outcome=needs_approval ;;
+  done|failed)    registry_live_state=idle    registry_outcome=$transition ;;
+  interrupted)    registry_live_state=idle    registry_outcome="" ;;
+  closed)         registry_live_state=closed  registry_outcome=__keep__ ;;
+  registered)     registry_live_state=idle    registry_outcome=__keep__ ;;
+  *)              registry_live_state=""      registry_outcome=__keep__ ;;
+esac
+
+# ---- Write the registry (atomic, under the shared per-thread mkdir lock used by claude-threads)
+is_pinned=0 is_snoozed=$window_is_snoozed snooze_label="" has_snooze_news=0 is_settled=$window_is_settled
+if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
+  mkdir -p "$locks_dir" 2>/dev/null
+  git_branch=""
+  if [[ ( "$hook_event" == SessionStart || "$hook_event" == UserPromptSubmit ) && -d "$hook_cwd" ]]; then
+    git_branch=$(git -C "$hook_cwd" branch --show-current 2>/dev/null)
+  fi
+  thread_path="$threads_dir/$session_id.json"
+  lock_dir="$locks_dir/$session_id.lock"
+  for _ in {1..200}; do mkdir "$lock_dir" 2>/dev/null && break; sleep 0.01; done   # ~2s, then steal
+  [[ -d "$lock_dir" ]] || mkdir "$lock_dir" 2>/dev/null
+  existing_thread='{}'
+  [[ -s "$thread_path" ]] && existing_thread=$(<"$thread_path")
+  if registry_output=$(jq -rc \
+      --arg session_id "$session_id" --arg cwd "$hook_cwd" --arg transcript_path "$transcript_path" \
+      --arg git_branch "$git_branch" --arg pane "${TMUX_PANE:-}" --arg window_id "$window_id" \
+      --arg window_name "$window_name" --arg pane_title "$pane_title" --arg event "$hook_event" \
+      --arg live_state "$registry_live_state" --arg outcome "$registry_outcome" --arg detail "$outcome_detail" \
+      --arg sep "$field_separator" --argjson now "$now" '
+      def nonempty($value): if $value == "" then null else $value end;
+      .session_id = $session_id
+      | .source = (.source // "hook")
+      | .started_at = (.started_at // $now)
+      | .cwd = (nonempty($cwd) // .cwd)
+      | .transcript_path = (nonempty($transcript_path) // .transcript_path)
+      | .git_branch = (nonempty($git_branch) // .git_branch)
+      | (if $pane != "" and $event != "SessionEnd" then
+           .tmux_pane = $pane | .tmux_window_id = $window_id | .window_name = $window_name
+           | (if $pane_title != "" then .pane_title = ($pane_title | sub("^[^[:alnum:]]+"; "")) else . end)
+         else . end)
+      | (if $live_state != "" then .live_state = $live_state | .last_activity_at = $now else . end)
+      | (if $outcome == "__keep__" then .
+         elif $outcome == "" then .outcome = null | .outcome_detail = null | .outcome_at = $now
+         else .outcome = $outcome | .outcome_detail = nonempty($detail) | .outcome_at = $now end)
+      | (if $event == "SessionEnd" then .closed_at = $now else . end)
+      | (if $event == "UserPromptSubmit" then
+           (if .settled == true then .settled = false | .settled_at = null | .settled_reason = null | .unsettled_at = $now else . end)
+           | (if (.snoozed_until // 0) > 0 then
+                .snoozed_until = null | .snooze_news = null | .snooze_woke_at = $now | .snooze_woke_reason = "engaged"
+              else . end)
+         else . end)
+      | (if (.snoozed_until // 0) > $now and ($outcome == "done" or $outcome == "failed") then .snooze_news = $outcome else . end)
+      | ., ([ (if .pinned == true then "1" else "0" end),
+              (if (.snoozed_until // 0) > $now then "1" else "0" end),
+              (if (.snoozed_until // 0) > $now then (.snoozed_until | strflocaltime("%a %H:%M")) else "" end),
+              (if .snooze_news then "1" else "0" end),
+              (if .settled == true then "1" else "0" end) ] | join($sep))
+    ' <<<"$existing_thread" 2>/dev/null); then
+    temp_path="$thread_path.tmp.$$"
+    if head -n 1 <<<"$registry_output" >"$temp_path"; then mv -f "$temp_path" "$thread_path"; else rm -f "$temp_path"; fi
+    IFS=$field_separator read -r is_pinned is_snoozed snooze_label has_snooze_news is_settled < <(tail -n 1 <<<"$registry_output")
+  fi
+  rmdir "$lock_dir" 2>/dev/null
+
+  # Keep the registry reconciled (closed detection, auto-settle) at most hourly while Claude is in use.
+  if [[ "$hook_event" == Stop || "$hook_event" == StopFailure ]]; then
+    sweep_stamp="$state_root/.last-sweep"
+    if [[ ! -f "$sweep_stamp" ]] || (( now - $(stat -f %m "$sweep_stamp") > 3600 )); then
+      nohup "$HOME/.local/bin/claude-threads" sweep --if-older-than 3600 >/dev/null 2>&1 &
+    fi
+  fi
+fi
+
+[[ -n "${TMUX_PANE:-}" ]] || exit 0
+
+# ---- Mirror into tmux (one tmux invocation)
+target=(-t "$TMUX_PANE")
+tmux_commands=()
+add_set()   { tmux_commands+=(set -w "${target[@]}" "$1" "$2" \;); }
+add_unset() { tmux_commands+=(set -wu "${target[@]}" "$1" \;); }
+case "$transition" in
+  running)
+    add_unset @claude_waiting; add_unset @claude_outcome; add_unset @claude_pending_approval_tool; add_set @claude_running 1 ;;
+  needs_approval)
+    add_set @claude_waiting 1; add_set @claude_outcome needs_approval; add_unset @claude_running
+    [[ -n "$approval_tool" ]] && add_set @claude_pending_approval_tool "$approval_tool" ;;
+  done|failed)
+    add_set @claude_waiting 1; add_set @claude_outcome "$transition"; add_unset @claude_running
+    add_unset @claude_pending_approval_tool ;;
+  interrupted|closed)
+    add_unset @claude_waiting; add_unset @claude_outcome; add_unset @claude_running; add_unset @claude_pending_approval_tool ;;
+esac
+if [[ "$transition" == closed ]]; then
+  # The pane may fall back to a shell; drop every thread marker.
+  for window_option in @claude_session_id @claude_pinned @claude_snoozed @claude_snoozed_label @claude_snooze_news @claude_settled; do
+    add_unset "$window_option"
+  done
+elif [[ -n "$session_id" ]]; then
+  add_set @claude_session_id "$session_id"
+  if [[ "$is_pinned" == 1 ]]; then add_set @claude_pinned 1; else add_unset @claude_pinned; fi
+  if [[ "$is_snoozed" == 1 ]]; then add_set @claude_snoozed 1; add_set @claude_snoozed_label "$snooze_label"
+  else add_unset @claude_snoozed; add_unset @claude_snoozed_label; fi
+  if [[ "$is_snoozed" == 1 && "$has_snooze_news" == 1 ]]; then add_set @claude_snooze_news 1; else add_unset @claude_snooze_news; fi
+  if [[ "$is_settled" == 1 ]]; then add_set @claude_settled 1; else add_unset @claude_settled; fi
+fi
+((${#tmux_commands[@]})) && tmux "${tmux_commands[@]}" 2>/dev/null
+
+# ---- Speak running -> stopped transitions in windows you aren't watching
+[[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && "$was_running" == 1 && "$is_watched" != 1 && "$is_settled" != 1 ]] || exit 0
+[[ "$is_snoozed" == 1 && "$transition" != needs_approval ]] && exit 0   # only approvals break through a snooze
+
+spoken_failure_reason() {
+  case "$1" in
+    rate_limit) echo "rate limited" ;;
+    overloaded) echo "API overloaded" ;;
+    server_error) echo "server error" ;;
+    max_output_tokens) echo "output limit" ;;
+    billing_error|account_on_hold) echo "billing problem" ;;
+    authentication_failed|oauth_org_not_allowed|cloud_credential_error|verification_required) echo "login problem" ;;
+    invalid_request|model_not_found) echo "bad request" ;;
+    *) echo "" ;;
+  esac
+}
+case "$transition" in
+  needs_approval)
+    case "$outcome_detail" in
+      question)    suffix="has a question" ;;
+      plan_review) suffix="has a plan" ;;
+      *)           suffix="needs approval" ;;
+    esac ;;
+  done)   suffix="done" ;;
+  failed) failure_reason=$(spoken_failure_reason "$outcome_detail"); suffix="failed${failure_reason:+, $failure_reason}" ;;
+  *) exit 0 ;;
 esac
 
 # Named windows (automatic-rename off) say their name; auto-named ones say Claude's task summary.
@@ -48,13 +236,5 @@ if [[ "$automatic_rename" == 1 ]]; then
   spoken_name=$(sed -E 's/^[^[:alnum:]]+//' <<<"$pane_title")
 fi
 [[ -n "$spoken_name" ]] || spoken_name="Claude"
-
-# say has no volume option, so render to a temp file and play it with afplay's per-sound volume.
-# Detached so the hook returns immediately.
-speak_volume=${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}
-nohup bash -c '
-  speech_file=$(mktemp -t claude-tmux-speak).aiff
-  say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
-  rm -f "$speech_file" "${speech_file%.aiff}"
-' _ "$spoken_name $suffix" "$speak_volume" >/dev/null 2>&1 &
+"$HOME/.local/bin/claude-tmux-speak" "$spoken_name $suffix"
 exit 0

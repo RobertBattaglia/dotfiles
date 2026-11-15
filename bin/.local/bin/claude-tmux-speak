@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Speak a short announcement via macOS `say`, detached so callers (Claude hooks, claude-threads) return immediately.
+# say has no volume option, so render to a temp file and play it with afplay's per-sound volume.
+#
+# Usage: claude-tmux-speak "<text>"
+#   CLAUDE_TMUX_SPEAK=0          mute
+#   CLAUDE_TMUX_SPEAK_VOLUME=0.6 afplay volume (1 = normal) without touching the system volume
+[[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && -n "${1:-}" ]] || exit 0
+command -v say >/dev/null 2>&1 || exit 0
+nohup bash -c '
+  speech_file=$(mktemp -t claude-tmux-speak).aiff
+  say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
+  rm -f "$speech_file" "${speech_file%.aiff}"
+' _ "$1" "${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}" >/dev/null 2>&1 &
+exit 0

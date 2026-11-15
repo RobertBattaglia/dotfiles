@@ -93,8 +93,11 @@ Located in `~/.local/bin`:
 | `contributizer` | Visualize git blame statistics by author |
 | `copy` | Cross-platform clipboard utility |
 | `rsc` | Rsync wrapper for remote syncing (set `RSC_HOST` to configure) |
-| `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title; jump or create (bound to `<prefix>Space`) |
-| `claude-tmux-state` | Claude Code hook helper: tmux running/waiting window colours and spoken alerts (see below) |
+| `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title; jump or create (bound to `<prefix>Space`). Pinned windows first, then closed pinned Claude threads (Enter resumes); ctrl-t pins |
+| `claude-tmux-state` | Claude Code hook helper: records each session in the thread registry, tmux status colours, spoken alerts (see below) |
+| `claude-threads` | Claude thread registry CLI: pin, snooze, settle, reopen closed sessions, backfill/auto-settle sweep (`claude-threads --help`) |
+| `claude-threads-tick` | Status-bar timer that wakes expired snoozes (cheap; runs every `status-interval`) |
+| `claude-tmux-speak` | Detached `say`/`afplay` announcement helper shared by the above |
 
 ## ⌨️ Key Bindings
 
@@ -104,10 +107,14 @@ Located in `~/.local/bin`:
 - `<prefix>j/k` - Next/previous session
 - `<prefix>f` - Launch tmux-sessionizer
 - `<prefix>Space` - Launch tmux-windowizer
-- `<prefix>w` - Tree view of sessions/windows (Claude windows coloured: purple = running, red = waiting/done)
-- `<prefix>W` - Tree view of only Claude windows that are running or waiting
-- `<prefix>q` - Set a shortcut key for the current window in the tree view, shown as `[K]` in the status bar (empty clears; capital letters are safest)
+- `<prefix>w` - Tree view of sessions/windows (Claude windows coloured, see below)
+- `<prefix>W` - Tree view of only Claude windows that are running or your turn (not settled; not snoozed unless awaiting approval)
+- `<prefix>q` - Set a shortcut key for the current window in the tree view, shown as `[K]` in the status bar (empty clears; capital letters are safest). Remembered on the Claude thread and restored when it's reopened
 - `<prefix>a` / `<prefix>A` - Clear Claude highlights for the current / all windows
+- `<prefix>b` - Pin / unpin this window's Claude thread (`^`); prompts for a label, defaulting to Claude's task summary
+- `<prefix>B` - Pinned threads picker: Enter jumps to the window, or resumes a closed thread in a new window (`claude --resume`, same launch flags, tree key restored); ctrl-t unpins, ctrl-e edits the label
+- `<prefix>Z` - Snooze this thread (`30m`, `2h`, `14:30`, `9am`, `tomorrow`, `tomorrow 8am`, `mon`, `tonight`; empty or `wake` wakes)
+- `<prefix>S` / `<prefix>X` - Settle this thread (done with it) and keep / kill the window
 
 ### Zsh Aliases
 - `opengit` - Open current git repository in Chrome
@@ -116,84 +123,64 @@ Located in `~/.local/bin`:
 
 Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claude Code and Indeed installers). Instead, manually merge these custom hooks into the `"hooks"` object in `~/.claude/settings.json`. If an event already has entries, append these to its array.
 
-- **Tmux status indicators + spoken alerts**: every hook calls `claude-tmux-state` (in `bin/`), which sets window options that `tmux.conf` highlights in the status bar, `<prefix>w`/`<prefix>W`, and `tmux-windowizer`:
+- **Tmux status indicators + spoken alerts + thread registry**: every hook calls `claude-tmux-state` (in `bin/`). It reads the hook JSON on stdin (the event comes from `hook_event_name`; the argument is only a fallback), records the session in the thread registry, and sets window options that `tmux.conf` renders in the status bar, `<prefix>w`/`<prefix>W`, and `tmux-windowizer`:
 
-  | Hook | `claude-tmux-state` | Window | Spoken (macOS `say`) |
-  |------|---------------------|--------|----------------------|
-  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `running` | purple (`@claude_running`) | — |
-  | `Notification` | `waiting` | red (`@claude_waiting`) | `<window> needs input`, if it was running |
-  | `Stop` | `idle` | red (`@claude_waiting`) | `<window> done`, if it was running |
-  | `SessionEnd` | `clear` | no colour | — |
+  | Event | State | Window | Spoken (macOS `say`), if it was running and you're not looking |
+  |-------|-------|--------|------------------------------------------------------------------|
+  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | running | purple `●` | — |
+  | `PermissionRequest`, `PreToolUse` of `AskUserQuestion` / `ExitPlanMode`, `Notification` `permission_prompt` / `elicitation_dialog` | needs approval | amber `◆` | `<window> needs approval` / `has a question` / `has a plan` |
+  | `Stop` | done | green `✓` | `<window> done` |
+  | `StopFailure` (API error ended the turn) | failed | red `✗` | `<window> failed, rate limited` (etc.) |
+  | `PostToolUseFailure` with `is_interrupt` | interrupted | no colour | — |
+  | `SessionStart` / `SessionEnd` | registered / closed | no colour | — |
 
-  - Named windows are announced by name; auto-named windows by Claude's task summary (the pane title). Nothing is spoken for the window you're currently looking at. Set `CLAUDE_TMUX_SPEAK=0` to mute, or `CLAUDE_TMUX_SPEAK_VOLUME` (default `0.6`, `1` = normal) to change loudness without touching system volume
-  - Claude's later idle reminder (`Notification`, ~60s after finishing) is a no-op: the window is already red and wasn't running, so nothing is spoken
-  - `Stop` doesn't fire when you interrupt with Esc, so the window stays purple until your next prompt (or `<prefix>a`)
-  - `<prefix>W` lists only Claude windows that are waiting or running; `<prefix>a` / `<prefix>A` clear both flags for the current / all windows
+  - Named windows are announced by name; auto-named windows by Claude's task summary (the pane title). Set `CLAUDE_TMUX_SPEAK=0` to mute, or `CLAUDE_TMUX_SPEAK_VOLUME` (default `0.6`, `1` = normal) to change loudness without touching system volume
+  - Claude's `idle_prompt` reminder (`Notification`, ~60s after finishing) is ignored, so a finished turn stays green instead of being relabelled "needs input"
+  - `Stop` doesn't fire when you interrupt with Esc mid-text, so the window stays purple until your next prompt (or `<prefix>a`)
+
+- **Claude threads** (`claude-threads`): one JSON file per Claude session id in `~/.local/state/claude-threads/threads/`, so state survives closing the window and `claude --resume` (which keeps the session id).
+  - **Pinned** (`^`): sorts first in the windowizer; closed pinned threads stay listed (`↺`) and reopen in one keystroke. Pinned threads never auto-settle
+  - **Snoozed** (gray, `z`): no colour, no speech, hidden from `<prefix>W` until the wake time. If Claude finishes or fails meanwhile it shows `z!`. Approval prompts break through. On wake the window turns back to your-turn and announces `<window> snooze over` / `done while snoozed`. Typing a prompt wakes it early
+  - **Settled** (dim): you're done with it; it leaves the active views but stays resumable. Closing a window does **not** settle. Threads idle more than 3 days auto-settle (`CLAUDE_THREADS_SETTLE_DAYS`, or `SETTLE_DAYS=` in `~/.local/state/claude-threads/config`); windows are never killed automatically. Typing a prompt into a settled thread un-settles it. Settling keeps pins and clears snoozes
+  - **Sweep** (`claude-threads sweep`): backfills sessions from `~/.claude/projects/*/*.jsonl`, marks sessions whose Claude process died without `SessionEnd` as closed, and auto-settles. Runs at most hourly after a `Stop`, and on tmux `client-attached` at most every 30 minutes
+  - Set `"cleanupPeriodDays": 3650` in `~/.claude/settings.json`: Claude Code deletes transcripts after 30 days by default, after which a thread can no longer be resumed
 
 ```json
 {
+  "cleanupPeriodDays": 3650,
   "hooks": {
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state waiting || true"
-          }
-        ]
-      }
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state || true" }] }
     ],
     "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state running || true"
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state running || true" }] }
     ],
     "PreToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state running || true"
-          }
-        ]
-      }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state running || true" }] }
     ],
     "PostToolUse": [
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state running || true" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state || true" }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state || true" }] }
+    ],
+    "Notification": [
       {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state running || true"
-          }
-        ]
+        "matcher": "permission_prompt|worker_permission_prompt|elicitation_dialog|elicitation_url_dialog",
+        "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state waiting || true" }]
       }
     ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state idle || true"
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state idle || true" }] }
+    ],
+    "StopFailure": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state || true" }] }
     ],
     "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.local/bin/claude-tmux-state clear || true"
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/claude-tmux-state clear || true" }] }
     ]
   }
 }
