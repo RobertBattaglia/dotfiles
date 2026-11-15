@@ -26,16 +26,17 @@ hook_json=""
 [[ -t 0 ]] || hook_json=$(cat)
 
 hook_event="" session_id="" hook_cwd="" transcript_path="" notification_type="" tool_name="" stop_error=""
-is_interrupt=false has_pending_background_work=false
+is_interrupt=false has_pending_background_work=false session_start_source=""
 if [[ -n "$hook_json" ]]; then
   IFS=$field_separator read -r hook_event session_id hook_cwd transcript_path notification_type tool_name stop_error \
-    is_interrupt has_pending_background_work < <(
+    is_interrupt has_pending_background_work session_start_source < <(
     jq -r --arg sep "$field_separator" '[
         .hook_event_name // "", .session_id // "", .cwd // "", .transcript_path // "",
         .notification_type // "", .tool_name // "",
         (if .hook_event_name == "StopFailure" then (.error // "unknown" | tostring) else "" end),
         (.is_interrupt // false | tostring),
-        (((.background_tasks // []) + (.session_crons // [])) | length > 0 | tostring)
+        (((.background_tasks // []) + (.session_crons // [])) | length > 0 | tostring),
+        (if .hook_event_name == "SessionStart" then (.source // "") else "" end)
       ] | join($sep)' <<<"$hook_json" 2>/dev/null)
 fi
 
@@ -105,7 +106,7 @@ case "$transition" in
 esac
 
 # ---- Write the registry (atomic, under the shared per-thread mkdir lock used by claude-threads)
-is_pinned=0 is_snoozed=$window_is_snoozed snooze_label="" has_snooze_news=0 is_settled=$window_is_settled
+is_pinned=0 is_snoozed=$window_is_snoozed snooze_label="" has_snooze_news=0 is_settled=$window_is_settled recorded_outcome=""
 if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
   mkdir -p "$locks_dir" 2>/dev/null
   git_branch=""
@@ -151,11 +152,12 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
               (if (.snoozed_until // 0) > $now then "1" else "0" end),
               (if (.snoozed_until // 0) > $now then (.snoozed_until | strflocaltime("%a %H:%M")) else "" end),
               (if .snooze_news then "1" else "0" end),
-              (if .settled == true then "1" else "0" end) ] | join($sep))
+              (if .settled == true then "1" else "0" end),
+              (.outcome // "") ] | join($sep))
     ' <<<"$existing_thread" 2>/dev/null); then
     temp_path="$thread_path.tmp.$$"
     if head -n 1 <<<"$registry_output" >"$temp_path"; then mv -f "$temp_path" "$thread_path"; else rm -f "$temp_path"; fi
-    IFS=$field_separator read -r is_pinned is_snoozed snooze_label has_snooze_news is_settled < <(tail -n 1 <<<"$registry_output")
+    IFS=$field_separator read -r is_pinned is_snoozed snooze_label has_snooze_news is_settled recorded_outcome < <(tail -n 1 <<<"$registry_output")
   fi
   rmdir "$lock_dir" 2>/dev/null
 
@@ -186,6 +188,12 @@ case "$transition" in
     add_unset @claude_pending_approval_tool ;;
   interrupted|closed)
     add_unset @claude_waiting; add_unset @claude_outcome; add_unset @claude_running; add_unset @claude_pending_approval_tool ;;
+  registered)
+    # `claude --resume` (claude-restart-all, restore, reopen): bring back the finished turn's colour that the old
+    # process's SessionEnd cleared. A pending approval died with the old process, so it isn't restored.
+    if [[ "$session_start_source" == resume && ( "$recorded_outcome" == done || "$recorded_outcome" == failed ) ]]; then
+      add_set @claude_waiting 1; add_set @claude_outcome "$recorded_outcome"; add_unset @claude_running
+    fi ;;
 esac
 if [[ "$transition" == closed ]]; then
   # The pane may fall back to a shell; drop every thread marker.

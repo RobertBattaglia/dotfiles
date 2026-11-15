@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
 # Fuzzy finder for tmux windows across all sessions (bound to <prefix>Space in tmux). Searches the window name,
 # the foreground process's PID, the active pane's directory, and its pane title (e.g. Claude Code's task summary).
-# Enter on a match jumps to that window. If nothing matches, Enter creates a new window named
-# after the typed query in the current session.
+# Enter on a match jumps to that window.
 # Claude Code windows are marked: ◆ amber = needs approval, ✗ red = failed, ✓ green = done, ● purple = running,
 # z gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
 # was closed (↺; Enter resumes them in a new window via claude-threads open). ctrl-t toggles a pin.
 #
-# Usage: tmux-windowizer [SESSION_ID] [START_DIRECTORY]
+# Usage: tmux-windowizer [SESSION_ID]
 #        tmux-windowizer --rows            (print the list; used by fzf reload)
-#   (tmux.conf passes the current session and pane path; both are optional)
+#   (tmux.conf passes the current session, where closed threads are resumed; optional)
 set -uo pipefail
 
 list_only=0
 if [[ "${1:-}" == --rows ]]; then list_only=1; shift; fi
 current_session_id=${1:-}
-start_directory=${2:-$PWD}
 
 RUNNING_MARK=$'\e[38;2;124;58;237m●\e[0m'
 APPROVAL_MARK=$'\e[38;2;245;158;11m◆\e[0m'
@@ -78,14 +76,11 @@ all_rows() {
 
 if (( list_only )); then all_rows; exit 0; fi
 
-fzf_output=$(all_rows | fzf --ansi --print-query --delimiter=$'\t' --with-nth=2 \
+selected_line=$(all_rows | fzf --ansi --delimiter=$'\t' --with-nth=2 \
   --prompt="window> " --header="enter: jump/resume   ctrl-t: pin/unpin" \
   --bind "ctrl-t:execute-silent(claude-threads toggle-pin {1})+reload(tmux-windowizer --rows)" \
   --preview='case {1} in thread:*) claude-threads show {1} ;; *) tmux capture-pane -ep -t {1} ;; esac' \
   --preview-window=right,60%)
-
-query=$(sed -n 1p <<<"$fzf_output")
-selected_line=$(sed -n 2p <<<"$fzf_output")
 
 if [[ -n "$selected_line" ]]; then
   selected_id=${selected_line%%$'\t'*}
@@ -93,6 +88,4 @@ if [[ -n "$selected_line" ]]; then
     thread:*) claude-threads open "$selected_id" ${current_session_id:+--session "$current_session_id"} ;;
     *)        tmux switch-client -t "$selected_id" ;;
   esac
-elif [[ -n "$query" ]]; then
-  tmux new-window ${current_session_id:+-t "$current_session_id:"} -n "$query" -c "$start_directory"
 fi
