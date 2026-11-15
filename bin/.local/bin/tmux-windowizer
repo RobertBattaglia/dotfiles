@@ -4,16 +4,14 @@
 # Enter on a match jumps to that window.
 # Claude Code windows are marked: ◆ amber = needs approval, ✗ red = failed, ✓ green = done, ● purple = running,
 # z gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
-# was closed (↺; Enter resumes them in a new window via claude-threads open). ctrl-t toggles a pin.
+# was closed (↺; Enter resumes them via claude-threads open, in the tmux session they were last in). ctrl-t toggles a pin.
 #
-# Usage: tmux-windowizer [SESSION_ID]
+# Usage: tmux-windowizer
 #        tmux-windowizer --rows            (print the list; used by fzf reload)
-#   (tmux.conf passes the current session, where closed threads are resumed; optional)
 set -uo pipefail
 
 list_only=0
 if [[ "${1:-}" == --rows ]]; then list_only=1; shift; fi
-current_session_id=${1:-}
 
 RUNNING_MARK=$'\e[38;2;124;58;237m●\e[0m'
 APPROVAL_MARK=$'\e[38;2;245;158;11m◆\e[0m'
@@ -85,7 +83,7 @@ selected_line=$(all_rows | fzf --ansi --delimiter=$'\t' --with-nth=2 \
 if [[ -n "$selected_line" ]]; then
   selected_id=${selected_line%%$'\t'*}
   case "$selected_id" in
-    thread:*) claude-threads open "$selected_id" ${current_session_id:+--session "$current_session_id"} ;;
+    thread:*) claude-threads open "$selected_id" || { printf 'Press any key to close '; read -r -n 1 -s _; } ;;
     *)        tmux switch-client -t "$selected_id" ;;
   esac
 fi

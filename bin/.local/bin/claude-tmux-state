@@ -50,18 +50,31 @@ if [[ -z "$hook_event" ]]; then
   esac
 fi
 
+# Serialize this session's hook runs from here to exit: read tmux state -> write registry -> mirror into tmux.
+# (The last tool's PostToolUse and Stop fire together; releasing the lock before mirroring let a stale "running"
+# repaint the window after "done".) Shared with claude-threads' update_thread().
+lock_dir=""
+if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
+  mkdir -p "$locks_dir" 2>/dev/null
+  lock_dir="$locks_dir/$session_id.lock"
+  for _ in {1..200}; do mkdir "$lock_dir" 2>/dev/null && break; sleep 0.01; done   # ~2s, then steal
+  [[ -d "$lock_dir" ]] || mkdir "$lock_dir" 2>/dev/null
+  trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
+fi
+
 was_running=0 is_watched=0 automatic_rename=0 window_name="" pane_title="" pending_approval_tool=""
-window_id="" window_is_settled=0 window_is_snoozed=0
+window_id="" window_is_settled=0 window_is_snoozed=0 tmux_session_name=""
 if [[ -n "${TMUX_PANE:-}" ]]; then
   # Pane titles are dropped when they are the shell's default "user@host:dir".
   {
     IFS= read -r was_running; IFS= read -r is_watched; IFS= read -r automatic_rename
     IFS= read -r window_name; IFS= read -r pane_title; IFS= read -r pending_approval_tool
     IFS= read -r window_id; IFS= read -r window_is_settled; IFS= read -r window_is_snoozed
+    IFS= read -r tmux_session_name
   } < <(tmux display -p -t "$TMUX_PANE" "$(printf '%s\n' \
       '#{?@claude_running,1,0}' '#{&&:#{window_active},#{session_attached}}' '#{automatic-rename}' \
       '#{window_name}' '#{?#{m:*@#{host_short}:*,#{pane_title}},,#{pane_title}}' '#{@claude_pending_approval_tool}' \
-      '#{window_id}' '#{?@claude_settled,1,0}' '#{?@claude_snoozed,1,0}')" 2>/dev/null)
+      '#{window_id}' '#{?@claude_settled,1,0}' '#{?@claude_snoozed,1,0}' '#{session_name}')" 2>/dev/null)
 fi
 
 # ---- Derive the transition: running | needs_approval | done | failed | interrupted | closed | registered | noop
@@ -108,21 +121,17 @@ esac
 # ---- Write the registry (atomic, under the shared per-thread mkdir lock used by claude-threads)
 is_pinned=0 is_snoozed=$window_is_snoozed snooze_label="" has_snooze_news=0 is_settled=$window_is_settled recorded_outcome=""
 if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
-  mkdir -p "$locks_dir" 2>/dev/null
   git_branch=""
   if [[ ( "$hook_event" == SessionStart || "$hook_event" == UserPromptSubmit ) && -d "$hook_cwd" ]]; then
     git_branch=$(git -C "$hook_cwd" branch --show-current 2>/dev/null)
   fi
   thread_path="$threads_dir/$session_id.json"
-  lock_dir="$locks_dir/$session_id.lock"
-  for _ in {1..200}; do mkdir "$lock_dir" 2>/dev/null && break; sleep 0.01; done   # ~2s, then steal
-  [[ -d "$lock_dir" ]] || mkdir "$lock_dir" 2>/dev/null
   existing_thread='{}'
   [[ -s "$thread_path" ]] && existing_thread=$(<"$thread_path")
   if registry_output=$(jq -rc \
       --arg session_id "$session_id" --arg cwd "$hook_cwd" --arg transcript_path "$transcript_path" \
       --arg git_branch "$git_branch" --arg pane "${TMUX_PANE:-}" --arg window_id "$window_id" \
-      --arg window_name "$window_name" --arg pane_title "$pane_title" --arg event "$hook_event" \
+      --arg window_name "$window_name" --arg tmux_session_name "$tmux_session_name" --arg pane_title "$pane_title" --arg event "$hook_event" \
       --arg live_state "$registry_live_state" --arg outcome "$registry_outcome" --arg detail "$outcome_detail" \
       --arg sep "$field_separator" --argjson now "$now" '
       def nonempty($value): if $value == "" then null else $value end;
@@ -134,6 +143,7 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
       | .git_branch = (nonempty($git_branch) // .git_branch)
       | (if $pane != "" and $event != "SessionEnd" then
            .tmux_pane = $pane | .tmux_window_id = $window_id | .window_name = $window_name
+           | .tmux_session_name = (nonempty($tmux_session_name) // .tmux_session_name)
            | (if $pane_title != "" then .pane_title = ($pane_title | sub("^[^[:alnum:]]+"; "")) else . end)
          else . end)
       | (if $live_state != "" then .live_state = $live_state | .last_activity_at = $now else . end)
@@ -159,12 +169,13 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
     if head -n 1 <<<"$registry_output" >"$temp_path"; then mv -f "$temp_path" "$thread_path"; else rm -f "$temp_path"; fi
     IFS=$field_separator read -r is_pinned is_snoozed snooze_label has_snooze_news is_settled recorded_outcome < <(tail -n 1 <<<"$registry_output")
   fi
-  rmdir "$lock_dir" 2>/dev/null
 
   # Keep the registry reconciled (closed detection, auto-settle) at most hourly while Claude is in use.
   if [[ "$hook_event" == Stop || "$hook_event" == StopFailure ]]; then
     sweep_stamp="$state_root/.last-sweep"
-    if [[ ! -f "$sweep_stamp" ]] || (( now - $(stat -f %m "$sweep_stamp") > 3600 )); then
+    # date -r works with both BSD and GNU (Homebrew's gnubin stat shadows BSD stat, and `stat -f` means something else there)
+    last_sweep_at=$(date -r "$sweep_stamp" +%s 2>/dev/null || echo 0)
+    if (( now - last_sweep_at > 3600 )); then
       nohup "$HOME/.local/bin/claude-threads" sweep --if-older-than 3600 >/dev/null 2>&1 &
     fi
   fi

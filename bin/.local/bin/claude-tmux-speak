@@ -8,8 +8,10 @@
 [[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && -n "${1:-}" ]] || exit 0
 command -v say >/dev/null 2>&1 || exit 0
 nohup bash -c '
-  speech_file=$(mktemp -t claude-tmux-speak).aiff
+  # explicit XXXXXX template: works with BSD and GNU mktemp (Homebrew gnubin shadows BSD, and GNU rejects -t NAME)
+  temporary_base=$(mktemp "${TMPDIR:-/tmp}/claude-tmux-speak.XXXXXX") || exit 0
+  speech_file="$temporary_base.aiff"
   say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
-  rm -f "$speech_file" "${speech_file%.aiff}"
+  rm -f "$speech_file" "$temporary_base"
 ' _ "$1" "${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}" >/dev/null 2>&1 &
 exit 0
