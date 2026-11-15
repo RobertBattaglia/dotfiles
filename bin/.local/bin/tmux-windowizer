@@ -3,7 +3,7 @@
 # the foreground process's PID, the active pane's directory, and its pane title (e.g. Claude Code's task summary).
 # Enter on a match jumps to that window.
 # Claude Code windows are marked: ◆ amber = needs approval, ✗ red = failed, ✓ green = done, ● purple = running,
-# z gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
+# zzz gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
 # was closed (↺; Enter resumes them via claude-threads open, in the tmux session they were last in). ctrl-t toggles a pin.
 #
 # Usage: tmux-windowizer
@@ -17,7 +17,7 @@ RUNNING_MARK=$'\e[38;2;124;58;237m●\e[0m'
 APPROVAL_MARK=$'\e[38;2;245;158;11m◆\e[0m'
 DONE_MARK=$'\e[38;2;21;128;61m✓\e[0m'
 FAILED_MARK=$'\e[38;2;185;28;28m✗\e[0m'
-SNOOZED_MARK=$'\e[38;2;156;163;175mz\e[0m'
+SNOOZED_MARK=$'\e[38;2;156;163;175mzzz\e[0m'
 SETTLED_MARK=$'\e[2m·\e[0m'
 PIN_MARK=$'\e[38;2;245;158;11m^\e[0m'
 
@@ -53,6 +53,7 @@ list_windows() {
     {
       marker = ($2 == "approval") ? approval_mark : ($2 == "settled") ? settled_mark : ($2 == "snoozed") ? snoozed_mark \
              : ($2 == "failed") ? failed_mark : ($2 == "done") ? done_mark : ($2 == "running") ? running_mark : " "
+      if ($2 != "snoozed") marker = marker "  "   # pad to the width of zzz so the columns line up
       pin = ($8 == "1") ? pin_mark : " "
       directory = $5
       if (index(directory, home) == 1) directory = "~" substr(directory, length(home) + 1)

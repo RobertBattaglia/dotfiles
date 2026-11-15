@@ -322,7 +322,7 @@ def thread_marks(thread):
     if thread.get("pinned"):
         marks += AMBER + "^" + RESET
     if (thread.get("snoozed_until") or 0) > now_epoch():
-        marks += GRAY + "z" + RESET
+        marks += GRAY + "zzz" + RESET
     if thread.get("settled"):
         marks += DIM + "s" + RESET
     outcome = thread.get("outcome")
@@ -354,7 +354,7 @@ def command_list(arguments):
         return
     for thread in threads:
         visible_marks = re.sub(r"\033\[[0-9;]*m", "", thread_marks(thread))
-        padding = " " * max(0, 4 - len(visible_marks))
+        padding = " " * max(0, 6 - len(visible_marks))
         print(f"{thread['session_id'][:8]}  {thread_marks(thread)}{padding} {format_age(thread.get('last_activity_at')):>4}  "
               f"{(thread.get('live_state') or '?'):<7}  {DIM}{shorten_home(thread.get('cwd')):<40}{RESET}  {thread_title(thread)}")
 
@@ -530,7 +530,7 @@ def pinned_rows(only_closed=False):
         if only_closed and is_live:
             continue
         marker = AMBER + "^" + RESET if is_live else DIM + "↺" + RESET
-        snooze_mark = f" z {format_clock(thread['snoozed_until'])}" if (thread.get("snoozed_until") or 0) > now_epoch() else ""
+        snooze_mark = f" zzz {format_clock(thread['snoozed_until'])}" if (thread.get("snoozed_until") or 0) > now_epoch() else ""
         rows.append(f"thread:{session_id}\t{marker} {thread_title(thread)}  {DIM}{shorten_home(thread.get('cwd'))}  "
                     f"{thread.get('git_branch') or ''}{snooze_mark}{RESET}")
     return rows
@@ -1307,7 +1307,7 @@ def inbox_rows(view):
         elif woke_recently(thread, current_time):
             tag = f"{AMBER}woke {format_age(thread.get('snooze_woke_at'))}{RESET}  "
         elif is_snoozed(thread, current_time):
-            tag = f"{GRAY}z {format_clock(thread['snoozed_until'])}{RESET}  "
+            tag = f"{GRAY}zzz {format_clock(thread['snoozed_until'])}{RESET}  "
         else:
             tag = ""
         location, live_window_name = window_locations.get(session_id, (None, None))

@@ -81,7 +81,7 @@ git submodule update --remote
 - `ldappass` - Retrieves LDAP password
 - `claude-threads` - Python CLI for the Claude thread registry (`~/.local/state/claude-threads/threads/<session_id>.json`): pin, snooze, settle, open/resume, sweep, the `<prefix>i` inbox (inbox / pinned / snoozed / settled views), and snapshot/restore (`<prefix>R`). All registry writes go through its `update_thread()` (mkdir lock + tmp/rename); the `claude-tmux-state` hook takes the same lock
 - `claude-tmux-state` - Claude Code hook for every event: records the session in the registry and mirrors running/approval/done/failed state into tmux window options. Runs on every tool call, so keep it fast
-- `claude-threads-tick` - Called from the tmux status bar every 2s; wakes expired snoozes and, once a minute in the background, runs `claude-threads snapshot` (tmux windows + Claude launch flags, used by `claude-threads restore` / `<prefix>R`). No forks on the fast path
+- `claude-threads-tick` - Called from the tmux status bar every 1s (`status-interval 1`, so running windows pulse ●/○); wakes expired snoozes and, once a minute in the background, runs `claude-threads snapshot` (tmux windows + Claude launch flags, used by `claude-threads restore` / `<prefix>R`). No forks on the fast path
 - `claude-tmux-speak` - macOS `say` wrapper for Claude alerts (`CLAUDE_TMUX_SPEAK=0` mutes, `CLAUDE_TMUX_SPEAK_VOLUME` sets loudness)
 
 ## Configuration Details

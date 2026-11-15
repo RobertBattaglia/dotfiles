@@ -128,7 +128,7 @@ Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claud
 
   | Event | State | Window | Spoken (macOS `say`), if it was running and you're not looking |
   |-------|-------|--------|------------------------------------------------------------------|
-  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | running | purple `●` | — |
+  | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | running | purple `●` (pulses `●`/`○` in the status bar) | — |
   | `PermissionRequest`, `PreToolUse` of `AskUserQuestion` / `ExitPlanMode`, `Notification` `permission_prompt` / `elicitation_dialog` | needs approval | amber `◆` | `<window> needs approval` / `has a question` / `has a plan` |
   | `Stop` | done | green `✓` | `<window> done` |
   | `StopFailure` (API error ended the turn) | failed | red `✗` | `<window> failed, rate limited` (etc.) |

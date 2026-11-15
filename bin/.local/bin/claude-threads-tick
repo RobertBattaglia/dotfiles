@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Called from tmux status-right every status-interval (2s); prints nothing.
+# Called from tmux status-right every status-interval (1s); prints nothing.
 # Fast path is two file reads and integer compares (no forks); python only runs when a snooze has expired,
 # and once a minute (in the background) to snapshot tmux windows for `claude-threads restore`.
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/claude-threads"
