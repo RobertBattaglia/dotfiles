@@ -24,17 +24,24 @@ Usage:
   claude-threads settle <target> [--kill] [--confirm]   done with it: leaves active views, stays searchable/resumable
                                                   (--confirm asks y/n on the terminal first)
   claude-threads unsettle <target>
+  claude-threads delete <target> [--yes]          PERMANENT: removes the registry entry, transcript, subagent logs,
+                                                  file history; settled, closed threads only; asks twice unless --yes
+  claude-threads prune [--dry-run]                delete empty threads (nothing but /clear-style commands, or no
+                                                  transcript ever written) once closed; sweep does this automatically
   claude-threads sweep [--if-older-than SECONDS]  backfill transcripts, detect closed sessions, auto-settle
   claude-threads snapshot                         record tmux windows + Claude launch flags (claude-threads-tick, every 60s)
   claude-threads restore [--dry-run] [--yes] [--claude-only] [--hint] [--pause]
                                                   rebuild windows from the last snapshot of a tmux server that is gone; <prefix>R
   claude-threads inbox                            fzf over the registry (open, settle, snooze, pin); <prefix>i / W
                                                   views inbox / pinned / snoozed / settled, cycled with tab / shift-tab
-                  [--rows [--view NAME] | --footer | --cycle next|previous | --settle-key T | --snooze-key T | --label-key T]
+                  [--rows [--view NAME] | --footer | --cycle next|previous | --settle-key T | --snooze-key T | --label-key T
+                   | --delete-key T | --delete-bind T]
 
 Environment / config ($STATE/claude-threads/config, KEY=VALUE lines; env wins):
   CLAUDE_THREADS_SETTLE_DAYS (SETTLE_DAYS)     auto-settle threads inactive this long (default 3)
   CLAUDE_SNOOZE_MORNING_HOUR (MORNING_HOUR)    hour used for "tomorrow" / weekdays with no time (default 9)
+  CLAUDE_THREADS_PRUNE_EMPTY_HOURS (PRUNE_EMPTY_HOURS)   sweep deletes empty closed threads idle this long
+                                                  (default 1; 0 turns auto-pruning off)
 """
 import datetime
 import glob
@@ -42,6 +49,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import termios
@@ -83,6 +91,7 @@ def load_config():
 
 CONFIG = load_config()
 SETTLE_DAYS = float(os.environ.get("CLAUDE_THREADS_SETTLE_DAYS") or CONFIG.get("SETTLE_DAYS") or 3)
+PRUNE_EMPTY_HOURS = float(os.environ.get("CLAUDE_THREADS_PRUNE_EMPTY_HOURS") or CONFIG.get("PRUNE_EMPTY_HOURS") or 1)
 MORNING_HOUR = int(os.environ.get("CLAUDE_SNOOZE_MORNING_HOUR") or CONFIG.get("MORNING_HOUR") or 9)
 
 
@@ -847,6 +856,162 @@ def command_unsettle(arguments):
     notify(f"Unsettled: {thread_title(thread)}")
 
 
+# ---------------------------------------------------------------- delete: permanent removal + pruning empty threads
+
+# User entries that start with one of these never reached the model: slash commands (/clear, /model, ...), their
+# output, and !bash-mode input/output.
+LOCAL_ONLY_PROMPT_PREFIXES = ("<command-name>", "<command-message>", "<local-command-", "<bash-input>", "<bash-stdout>", "<bash-stderr>")
+EMPTY_TRANSCRIPT_MAX_BYTES = 1024 * 1024   # anything bigger is assumed to hold a conversation without reading it
+
+
+def transcript_has_conversation(transcript_path):
+    """True once a transcript holds any assistant reply or any prompt actually sent to Claude (text, image, ...).
+    A /clear (or /model, /mcp, !ls ...) followed by nothing has no conversation. Unreadable or large = True."""
+    try:
+        if os.path.getsize(transcript_path) > EMPTY_TRANSCRIPT_MAX_BYTES:
+            return True
+        with open(transcript_path, "rb") as transcript:
+            for entry in parse_json_lines(transcript.read(), False):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "assistant":
+                    return True
+                if entry.get("type") != "user" or entry.get("isMeta"):
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "text":
+                        return True
+                    text = (block.get("text") or "").strip()
+                    if text and not text.startswith(LOCAL_ONLY_PROMPT_PREFIXES):
+                        return True
+    except OSError:
+        return True
+    return False
+
+
+def thread_is_empty(thread):
+    """Nothing worth keeping: an empty transcript, or a hook-only thread whose transcript never existed
+    (sweep records transcript_mtime whenever it sees one, so its absence means Claude never wrote it)."""
+    transcript_path = thread.get("transcript_path")
+    if transcript_path and os.path.exists(transcript_path):
+        return not transcript_has_conversation(transcript_path)
+    return thread.get("source") == "hook" and "transcript_mtime" not in thread and not thread.get("title")
+
+
+def session_artifact_paths(session_id):
+    """Everything Claude Code keeps for a session (session_id is validated, so it is safe inside a glob)."""
+    candidates = (glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", session_id + ".jsonl"))
+                  + glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", session_id))                # subagents, tool results
+                  + glob.glob(os.path.join(CLAUDE_CONFIG_DIR, "todos", session_id + "-*.json"))
+                  + [os.path.join(CLAUDE_CONFIG_DIR, "file-history", session_id),
+                     os.path.join(CLAUDE_CONFIG_DIR, "session-env", session_id)])
+    return [path for path in candidates if os.path.lexists(path)]
+
+
+def delete_thread_permanently(session_id):
+    """Remove the thread and all of its Claude Code artifacts. The transcript has to go too, or the next sweep
+    would backfill the thread right back. Returns the removed paths."""
+    if not SESSION_ID_PATTERN.match(session_id):
+        raise CommandError(f"bad session id {session_id!r}")
+    lock_dir = os.path.join(LOCKS_DIR, session_id + ".lock")
+    acquire_lock(lock_dir)
+    removed_paths = []
+    try:
+        for path in session_artifact_paths(session_id) + [thread_path(session_id)]:
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                removed_paths.append(path)
+            except FileNotFoundError:
+                continue
+    finally:
+        release_lock(lock_dir)
+    return removed_paths
+
+
+def deletion_blocker(session_id, thread, live_sessions=None):
+    """Why this thread can't be deleted right now, or None."""
+    live_sessions = live_claude_processes() if live_sessions is None else live_sessions
+    if session_id in live_sessions or thread.get("live_state") == "running":
+        return "it's still running; quit Claude in that window first"
+    return None
+
+
+def describe_for_deletion(thread):
+    transcript_path = thread.get("transcript_path")
+    if not transcript_path or not os.path.exists(transcript_path):
+        return "no transcript"
+    size_kib = os.path.getsize(transcript_path) / 1024
+    contents = "conversation" if transcript_has_conversation(transcript_path) else "empty"
+    return f"{contents}, {size_kib:.0f} KiB transcript"
+
+
+def command_delete(arguments):
+    skip_confirmation = "--yes" in arguments
+    positional_arguments = [argument for argument in arguments if argument != "--yes"]
+    session_id, _ = resolve_target(positional_arguments[0] if positional_arguments else "")
+    thread = load_thread(session_id) or {}
+    if not thread.get("settled"):
+        raise CommandError("only settled threads can be deleted (settle it first)")
+    blocker = deletion_blocker(session_id, thread)
+    if blocker:
+        raise CommandError(f"can't delete: {blocker}")
+    title = thread_title(thread)
+    if not skip_confirmation:
+        if not confirm_on_terminal(f"Delete '{title}' ({describe_for_deletion(thread)})?"):
+            return
+        if not confirm_on_terminal(f"{RED}This permanently erases the transcript and cannot be undone or resumed. "
+                                   f"Are you sure?{RESET}"):
+            return
+    delete_thread_permanently(session_id)
+    notify(f"Deleted: {title}")
+
+
+def prunable_threads(current_time=None, live_sessions=None):
+    """Empty, closed threads idle for PRUNE_EMPTY_HOURS. Pinned threads are kept: a pin is a deliberate choice."""
+    current_time = current_time or now_epoch()
+    live_sessions = live_claude_processes() if live_sessions is None else live_sessions
+    idle_seconds = PRUNE_EMPTY_HOURS * 3600
+    prunable = []
+    for thread in all_threads():
+        session_id = thread.get("session_id")
+        if (not session_id or not SESSION_ID_PATTERN.match(session_id) or thread.get("pinned")
+                or deletion_blocker(session_id, thread, live_sessions)
+                or current_time - (thread.get("last_activity_at") or thread.get("started_at") or 0) < idle_seconds):
+            continue
+        if thread_is_empty(thread):
+            prunable.append(thread)
+    return prunable
+
+
+def prune_empty_threads(live_sessions=None, dry_run=False):
+    if PRUNE_EMPTY_HOURS <= 0:
+        return []
+    prunable = prunable_threads(live_sessions=live_sessions)
+    if not dry_run:
+        for thread in prunable:
+            delete_thread_permanently(thread["session_id"])
+    return prunable
+
+
+def command_prune(arguments):
+    dry_run = "--dry-run" in arguments
+    if PRUNE_EMPTY_HOURS <= 0 and not dry_run:
+        print("auto-pruning is off (PRUNE_EMPTY_HOURS=0)")
+        return
+    pruned = prunable_threads() if dry_run else prune_empty_threads()
+    for thread in pruned:
+        print(f"{'would delete' if dry_run else 'deleted'}  {thread['session_id'][:8]}  "
+              f"{format_age(thread.get('last_activity_at')):>4}  {shorten_home(thread.get('cwd')):<40}  {thread_title(thread)}")
+    print(f"{len(pruned)} empty thread{'s' if len(pruned) != 1 else ''} {'would be ' if dry_run else ''}deleted")
+
+
 # ---------------------------------------------------------------- sweep: backfill + reconcile + auto-settle
 
 def iso_to_epoch(timestamp):
@@ -957,7 +1122,10 @@ def sweep_registry():
 
         update_thread(session_id, merge_backfill)
 
-    # 2. Reconcile liveness and auto-settle.
+    # 2. Permanently delete empty threads (a /clear nobody typed into, a session that never wrote a transcript).
+    prune_empty_threads(live_sessions)
+
+    # 3. Reconcile liveness and auto-settle.
     windows_to_clear, windows_to_mirror = [], []
     for thread_file_path in glob.glob(os.path.join(THREADS_DIR, "*.json")):
         session_id = os.path.basename(thread_file_path)[:-len(".json")]
@@ -1220,7 +1388,7 @@ INBOX_VIEW_HEADERS = {
     "inbox": INBOX_COMMON_KEYS,
     "pinned": "enter: open/resume   ctrl-s: settle/unsettle   ctrl-z: snooze   ctrl-t: unpin   ctrl-e: edit label",
     "snoozed": "enter: open/resume   ctrl-s: settle   ctrl-z: new time or wake   ctrl-t: pin/unpin",
-    "settled": "enter: open/resume   ctrl-s: unsettle   ctrl-z: snooze   ctrl-t: pin/unpin",
+    "settled": "enter: open/resume   ctrl-s: unsettle   ctrl-z: snooze   ctrl-t: pin/unpin   ctrl-x: DELETE forever",
 }
 INBOX_SWEEP_MAX_AGE_SECONDS = 300
 WOKE_HIGHLIGHT_SECONDS = 3600
@@ -1369,6 +1537,15 @@ def inbox_label_key(target):
         mirror_to_window(session_id)
 
 
+def inbox_delete_key(target):
+    """Errors are held on screen: execute() hides the tmux status line behind the popup."""
+    try:
+        command_delete([target])
+    except CommandError as error:
+        print(f"{RED}{error}{RESET}")
+        read_keypress("Press any key ")
+
+
 def command_inbox(arguments):
     view = current_inbox_view(arguments)
     target = arguments[1] if len(arguments) > 1 else ""
@@ -1397,6 +1574,15 @@ def command_inbox(arguments):
     if arguments[:1] == ["--label-key"] and target:
         inbox_label_key(target)
         return
+    if arguments[:1] == ["--delete-bind"]:
+        # ctrl-x does nothing outside the settled view. target is fzf's {1}, i.e. thread:<session_id>.
+        session_id = target.removeprefix("thread:")
+        if view == "settled" and SESSION_ID_PATTERN.match(session_id):
+            print(f"execute(claude-threads inbox --delete-key thread:{session_id})+reload(claude-threads inbox --rows)")
+        return
+    if arguments[:1] == ["--delete-key"] and target:
+        inbox_delete_key(target)
+        return
 
     command_sweep(["--if-older-than", str(INBOX_SWEEP_MAX_AGE_SECONDS)])
     if not all_threads():
@@ -1415,6 +1601,7 @@ def command_inbox(arguments):
          "--bind", f"ctrl-z:execute(claude-threads inbox --snooze-key {{1}})+{reload_rows}",
          "--bind", f"ctrl-t:execute-silent(claude-threads toggle-pin {{1}})+{reload_rows}",
          "--bind", f"ctrl-e:execute(claude-threads inbox --label-key {{1}})+{reload_rows}",
+         "--bind", "ctrl-x:transform(claude-threads inbox --delete-bind {1})",
          "--wrap=word", "--bind", "ctrl-/:change-preview-window(down,45%|hidden|right,40%)",
          "--preview", "claude-threads show {1}", "--preview-window=right,40%,wrap"],
         input="\n".join(rows) + ("\n" if rows else ""), stdout=subprocess.PIPE, text=True)
@@ -1439,7 +1626,8 @@ COMMANDS = {
     "pin": command_pin, "unpin": command_unpin, "toggle-pin": command_toggle_pin,
     "open": command_open, "snooze-prompt": command_snooze_prompt,
     "snooze": command_snooze, "wake": command_wake, "wake-due": command_wake_due,
-    "settle": command_settle, "unsettle": command_unsettle, "sweep": command_sweep, "inbox": command_inbox,
+    "settle": command_settle, "unsettle": command_unsettle,
+    "delete": command_delete, "prune": command_prune, "sweep": command_sweep, "inbox": command_inbox,
     "snapshot": command_snapshot, "restore": command_restore,
 }
 
