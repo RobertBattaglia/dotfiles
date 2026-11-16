@@ -93,7 +93,7 @@ Located in `~/.local/bin`:
 | `contributizer` | Visualize git blame statistics by author |
 | `copy` | Cross-platform clipboard utility |
 | `rsc` | Rsync wrapper for remote syncing (set `RSC_HOST` to configure) |
-| `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title, and jump to one (bound to `<prefix>Space`). Pinned windows first, then closed pinned Claude threads (Enter resumes); ctrl-t pins |
+| `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title, and jump to one (bound to `<prefix>Space`). Live windows only (closed Claude threads are in the inbox); pinned windows first; ctrl-t pins; ctrl-d closes a window after a y/n |
 | `claude-tmux-state` | Claude Code hook helper: records each session in the thread registry, tmux status colours, spoken alerts (see below) |
 | `claude-threads` | Claude thread registry CLI: pin, snooze, settle, reopen closed sessions, backfill/auto-settle sweep (`claude-threads --help`) |
 | `claude-threads-tick` | Status-bar timer that wakes expired snoozes (cheap; runs every `status-interval`) |
@@ -141,7 +141,7 @@ Claude Code config isn't stowed (`~/.claude/settings.json` is rewritten by Claud
   - `Stop` doesn't fire when you interrupt with Esc mid-text, so the window stays purple until your next prompt
 
 - **Claude threads** (`claude-threads`): one JSON file per Claude session id in `~/.local/state/claude-threads/threads/`, so state survives closing the window and `claude --resume` (which keeps the session id).
-  - **Pinned** (`^`, `<prefix>T` / inbox `ctrl-t`): sorts first in the inbox and the windowizer; closed pinned threads stay listed (`↺`) and reopen in one keystroke. The inbox's pinned view lists every pin in the order you pinned them. Pinned threads never auto-settle
+  - **Pinned** (`^`, `<prefix>T` / inbox `ctrl-t`): sorts first in the inbox and the windowizer; closed pinned threads stay in the inbox (`↺`) and reopen in one keystroke. The inbox's pinned view lists every pin in the order you pinned them. Pinned threads never auto-settle
   - **Snoozed** (gray, `z`): no colour, no speech, hidden from the inbox until the wake time. If Claude finishes or fails meanwhile it shows `z!`. Approval prompts break through. On wake the window turns back to your-turn and announces `<window> snooze over` / `done while snoozed`. Typing a prompt wakes it early
   - **Settled** (dim): you're done with it; it leaves the active views but stays resumable. Closing a window does **not** settle. Threads idle more than 3 days auto-settle (`CLAUDE_THREADS_SETTLE_DAYS`, or `SETTLE_DAYS=` in `~/.local/state/claude-threads/config`); windows are never killed automatically. Typing a prompt into a settled thread un-settles it; so does `<prefix>S` on its window, or `ctrl-s` on it in the inbox's settled or pinned view, which is the way back for closed threads and auto-settled ones. Settling keeps pins and clears snoozes
   - **Inbox** (`<prefix>i`, `claude-threads inbox`): an fzf popup over the registry rather than tmux windows, so closed threads are listed too (`↺ closed`; Enter jumps to a live window, or resumes a closed thread with its original launch flags in the tmux session it was last in, recreating that session if it's gone). `tab` / `shift-tab` cycle four views, shown in the footer:
