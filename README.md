@@ -94,6 +94,7 @@ Located in `~/.local/bin`:
 | `copy` | Cross-platform clipboard utility |
 | `rsc` | Rsync wrapper for remote syncing (set `RSC_HOST` to configure) |
 | `tmux-windowizer` | Fuzzy find tmux windows across all sessions by name, directory, or pane title, and jump to one (bound to `<prefix>Space`). Live windows only (closed Claude threads are in the inbox); pinned windows first; ctrl-t pins; ctrl-d closes a window after a y/n |
+| `git-branch-review` | Fetch, soft-reset to where the branch split off from origin's default branch, and open nvim's `:Git` status so every branch change shows as staged; puts the branch back when nvim quits (bound to `<prefix>G`; also `git branch-review`) |
 | `claude-tmux-state` | Claude Code hook helper: records each session in the thread registry, tmux status colours, spoken alerts (see below) |
 | `claude-threads` | Claude thread registry CLI: pin, snooze, settle, reopen closed sessions, backfill/auto-settle sweep (`claude-threads --help`) |
 | `claude-threads-tick` | Status-bar timer that wakes expired snoozes (cheap; runs every `status-interval`) |
@@ -110,6 +111,7 @@ Located in `~/.local/bin`:
 - `<prefix>f` - Launch tmux-sessionizer
 - `<prefix>Space` - Launch tmux-windowizer
 - `<prefix>t` - Swap this window with another (prompts for the window index)
+- `<prefix>G` - Review this branch in a side pane: `git-branch-review` (fetch, soft reset to the merge-base with origin's default branch, nvim `:Git`; branch restored on quit)
 - `<prefix>w` - Tree view of sessions/windows (Claude windows coloured, see below)
 - `<prefix>T` - Pin / unpin this window's Claude thread (`^`), same as `ctrl-t` in the inbox; the label defaults to Claude's task summary (edit it with `ctrl-e` in the inbox's pinned view)
 - `<prefix>Z` - Snooze this thread, pre-filled with the last snooze you used (4h the first time), so Enter repeats it (`30m`, `2h`, `14:30`, `9am`, `tomorrow`, `tomorrow 8am`, `mon`, `tonight`; `wake` wakes)

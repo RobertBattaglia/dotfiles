@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Review everything on this branch since it split off from origin's default branch, in fugitive's :Git status
+# window (bound to <prefix>G in tmux, which runs it in a side pane). Also works as `git branch-review`.
+#
+#   1. git fetch origin (a failed fetch warns and carries on with the last fetched refs)
+#   2. git reset --soft to the merge-base of HEAD and origin/<default branch>, so every commit on the branch shows
+#      up as staged changes (uncommitted work is kept as-is). The merge-base, not origin/<default> itself, keeps
+#      newer commits on the default branch from showing up as reversed changes.
+#   3. nvim +Git: ) / ( move between files, = shows a diff inline, dv opens it side by side.
+#
+# When nvim quits, the branch is put back on its original commit, unless HEAD moved while reviewing (e.g. you
+# committed, which squashes the branch on purpose); then it's left alone and the original commit is printed.
+#
+# Usage: git-branch-review
+set -uo pipefail
+
+notify() {
+  if [[ -n "${TMUX:-}" ]]; then tmux display-message -d 8000 "git-branch-review: $1"; fi
+  echo "git-branch-review: $1" >&2
+}
+
+fail() {
+  notify "$1"
+  read -r -n 1 -s -p "Press any key to close" </dev/tty
+  exit 1
+}
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "not inside a git work tree"
+
+echo "Fetching origin..."
+git fetch --quiet origin || echo "Fetch failed; using the last fetched origin refs" >&2
+
+default_branch_ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) ||
+  { git remote set-head origin --auto >/dev/null 2>&1 &&
+    default_branch_ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); } ||
+  default_branch_ref=origin/main
+
+original_head=$(git rev-parse HEAD) || fail "no commits on this branch yet"
+merge_base=$(git merge-base "$default_branch_ref" HEAD) || fail "no common ancestor with $default_branch_ref"
+
+restore_branch() {
+  trap - EXIT HUP INT TERM
+  [[ "$merge_base" == "$original_head" ]] && return
+  if [[ "$(git rev-parse HEAD)" == "$merge_base" ]]; then
+    git reset --quiet --soft "$original_head"
+  else
+    notify "HEAD moved while reviewing, so it was left as-is. The branch was at ${original_head:0:12}"
+  fi
+}
+
+if [[ "$merge_base" != "$original_head" ]]; then
+  git reset --quiet --soft "$merge_base" || fail "git reset --soft $merge_base failed"
+  trap restore_branch EXIT HUP INT TERM
+fi
+
+nvim -c 'Git' -c 'only'
