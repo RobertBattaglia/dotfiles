@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
-# Called from tmux status-right every status-interval (2s); prints nothing.
-# Fast path is one file read and an integer compare; python only runs when a snooze has expired.
-next_wake_file="${XDG_STATE_HOME:-$HOME/.local/state}/claude-threads/snooze_next_wake_at"
+# Called from tmux status-right every status-interval (1s); prints nothing.
+# Fast path is two file reads and integer compares (no forks); python only runs when a snooze has expired,
+# and once a minute (in the background) to snapshot tmux windows for `claude-threads restore`.
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/claude-threads"
+next_wake_file="$state_dir/snooze_next_wake_at"
+next_snapshot_file="$state_dir/next_snapshot_at"
+snapshot_interval_seconds=60
+now=${EPOCHSECONDS:-$(date +%s)}
+
+next_snapshot_at=0
+[[ -r "$next_snapshot_file" ]] && read -r next_snapshot_at <"$next_snapshot_file"
+[[ "$next_snapshot_at" =~ ^[0-9]+$ ]] || next_snapshot_at=0
+if (( now >= next_snapshot_at )) && [[ -d "$state_dir" ]]; then
+  echo $(( now + snapshot_interval_seconds )) >"$next_snapshot_file"
+  "$HOME/.local/bin/claude-threads" snapshot </dev/null >/dev/null 2>&1 &
+fi
+
 [[ -r "$next_wake_file" ]] || exit 0
 read -r next_wake_at <"$next_wake_file"
 [[ "$next_wake_at" =~ ^[0-9]+$ ]] || exit 0
-(( ${EPOCHSECONDS:-$(date +%s)} >= next_wake_at )) || exit 0
+(( now >= next_wake_at )) || exit 0
 "$HOME/.local/bin/claude-threads" wake-due >/dev/null 2>&1
 exit 0
