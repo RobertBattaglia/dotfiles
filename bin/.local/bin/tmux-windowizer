@@ -3,15 +3,28 @@
 # the foreground process's PID, the active pane's directory, and its pane title (e.g. Claude Code's task summary).
 # Enter on a match jumps to that window.
 # Claude Code windows are marked: ◆ amber = needs approval, ✗ red = failed, ✓ green = done, ● purple = running,
-# zzz gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first, then pinned Claude threads whose window
-# was closed (↺; Enter resumes them via claude-threads open, in the tmux session they were last in). ctrl-t toggles a pin.
+# zzz gray = snoozed, · dim = settled; ^ = pinned. Pinned windows sort first. Only live windows are listed: closed
+# Claude threads are in the inbox (<prefix>i). ctrl-t toggles a pin; ctrl-d closes the window after a y/n (a Claude
+# thread in it stays resumable from the inbox; closing doesn't settle it).
 #
 # Usage: tmux-windowizer
 #        tmux-windowizer --rows            (print the list; used by fzf reload)
+#        tmux-windowizer --close <window>  (ask y/n, then kill the window; used by ctrl-d)
 set -uo pipefail
 
 list_only=0
 if [[ "${1:-}" == --rows ]]; then list_only=1; shift; fi
+
+# ctrl-d: fzf hands this the terminal, so the question shows in the popup.
+if [[ "${1:-}" == --close ]]; then
+  window_id=${2:-}
+  [[ "$window_id" == @* ]] || exit 0
+  window_label=$(tmux display -p -t "$window_id" '#{session_name}:#{window_index} #{window_name}' 2>/dev/null) || exit 0
+  printf '\nClose window %s? (y/n) ' "$window_label"
+  read -r -n 1 -s answer </dev/tty
+  [[ "$answer" == [yY] ]] && tmux kill-window -t "$window_id"
+  exit 0
+fi
 
 RUNNING_MARK=$'\e[38;2;124;58;237m●\e[0m'
 APPROVAL_MARK=$'\e[38;2;245;158;11m◆\e[0m'
@@ -24,7 +37,7 @@ PIN_MARK=$'\e[38;2;245;158;11m^\e[0m'
 DIM=$'\e[2m' RESET=$'\e[0m'
 
 # One line per window: "sort_group<TAB>window_id<TAB><pin><marker> session:index  name  pid  ~/dir  title"
-# sort_group 0 = pinned window, 2 = other windows (1 = pinned closed threads, added in all_rows).
+# sort_group 0 = pinned window, 1 = other windows.
 # pid is the active pane's foreground process (e.g. Claude, matching ~/.claude/sessions/<pid>.json),
 # found as its terminal's foreground process-group leader, stepping through shell wrappers (like
 # `zsh -c "claude ..."` from claude-restart-all) to the program they launched.
@@ -59,32 +72,26 @@ list_windows() {
       if (index(directory, home) == 1) directory = "~" substr(directory, length(home) + 1)
       title = ($6 == "") ? "" : "  " $6
       pid = ($7 in foreground_pid) ? foreground_pid[$7] : "?"
-      printf "%s\t%s\t%s%s %s  %s  %s%s  %s%s%s\n", ($8 == "1") ? 0 : 2, $1, pin, marker, $3, $4, dim, pid, directory, reset, title
+      printf "%s\t%s\t%s%s %s  %s  %s%s  %s%s%s\n", ($8 == "1") ? 0 : 1, $1, pin, marker, $3, $4, dim, pid, directory, reset, title
     }' \
     <(ps -ax -o pid=,ppid=,pgid=,tpgid=,tty=,comm=) \
     <(tmux list-windows -a -F $'#{window_id}\t#{?#{==:#{@claude_outcome},needs_approval},approval,#{?@claude_settled,settled,#{?@claude_snoozed,snoozed,#{?#{==:#{@claude_outcome},failed},failed,#{?#{==:#{@claude_outcome},done},done,#{?@claude_running,running,}}}}}}\t#{session_name}:#{window_index}\t#{window_name}\t#{pane_current_path}\t#{?#{m:*@#{host_short}:*,#{pane_title}},,#{?#{==:#{pane_title},#{window_name}},,#{pane_title}}}\t#{pane_tty}\t#{?@claude_pinned,1,}')
 }
 
-# Windows plus pinned Claude threads whose window was closed, pinned first (sort -s keeps tmux order within a group).
+# Pinned windows first (sort -s keeps tmux order within a group).
 all_rows() {
-  {
-    list_windows
-    claude-threads pinned --rows closed 2>/dev/null | sed $'s/^/1\t/'
-  } | sort -s -t$'\t' -k1,1n | cut -f2-
+  list_windows | sort -s -t$'\t' -k1,1n | cut -f2-
 }
 
 if (( list_only )); then all_rows; exit 0; fi
 
 selected_line=$(all_rows | fzf --ansi --delimiter=$'\t' --with-nth=2 \
-  --prompt="window> " --header="enter: jump/resume   ctrl-t: pin/unpin" \
+  --prompt="window> " --header="enter: jump   ctrl-t: pin/unpin   ctrl-d: close window" \
   --bind "ctrl-t:execute-silent(claude-threads toggle-pin {1})+reload(tmux-windowizer --rows)" \
-  --preview='case {1} in thread:*) claude-threads show {1} ;; *) tmux capture-pane -ep -t {1} ;; esac' \
+  --bind "ctrl-d:execute(tmux-windowizer --close {1})+reload(tmux-windowizer --rows)" \
+  --preview='tmux capture-pane -ep -t {1}' \
   --preview-window=right,60%)
 
 if [[ -n "$selected_line" ]]; then
-  selected_id=${selected_line%%$'\t'*}
-  case "$selected_id" in
-    thread:*) claude-threads open "$selected_id" || { printf 'Press any key to close '; read -r -n 1 -s _; } ;;
-    *)        tmux switch-client -t "$selected_id" ;;
-  esac
+  tmux switch-client -t "${selected_line%%$'\t'*}"
 fi

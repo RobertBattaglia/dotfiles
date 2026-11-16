@@ -109,6 +109,7 @@ Located in `~/.local/bin`:
 - `<prefix>j/k` - Next/previous session
 - `<prefix>f` - Launch tmux-sessionizer
 - `<prefix>Space` - Launch tmux-windowizer
+- `<prefix>t` - Swap this window with another (prompts for the window index)
 - `<prefix>w` - Tree view of sessions/windows (Claude windows coloured, see below)
 - `<prefix>T` - Pin / unpin this window's Claude thread (`^`), same as `ctrl-t` in the inbox; the label defaults to Claude's task summary (edit it with `ctrl-e` in the inbox's pinned view)
 - `<prefix>Z` - Snooze this thread, pre-filled with the last snooze you used (4h the first time), so Enter repeats it (`30m`, `2h`, `14:30`, `9am`, `tomorrow`, `tomorrow 8am`, `mon`, `tonight`; `wake` wakes)

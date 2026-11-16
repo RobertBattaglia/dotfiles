@@ -131,7 +131,7 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
   if registry_output=$(jq -rc \
       --arg session_id "$session_id" --arg cwd "$hook_cwd" --arg transcript_path "$transcript_path" \
       --arg git_branch "$git_branch" --arg pane "${TMUX_PANE:-}" --arg window_id "$window_id" \
-      --arg window_name "$window_name" --arg tmux_session_name "$tmux_session_name" --arg pane_title "$pane_title" --arg event "$hook_event" \
+      --arg window_name "$window_name" --arg automatic_rename "$automatic_rename" --arg tmux_session_name "$tmux_session_name" --arg pane_title "$pane_title" --arg event "$hook_event" \
       --arg live_state "$registry_live_state" --arg outcome "$registry_outcome" --arg detail "$outcome_detail" \
       --arg sep "$field_separator" --argjson now "$now" '
       def nonempty($value): if $value == "" then null else $value end;
@@ -143,6 +143,7 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
       | .git_branch = (nonempty($git_branch) // .git_branch)
       | (if $pane != "" and $event != "SessionEnd" then
            .tmux_pane = $pane | .tmux_window_id = $window_id | .window_name = $window_name
+           | .window_named = ($automatic_rename != "1")   # you named it (automatic-rename off): reopen keeps the name
            | .tmux_session_name = (nonempty($tmux_session_name) // .tmux_session_name)
            | (if $pane_title != "" then .pane_title = ($pane_title | sub("^[^[:alnum:]]+"; "")) else . end)
          else . end)

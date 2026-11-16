@@ -13,7 +13,6 @@ Usage:
   claude-threads set <target> key=value ...       manual override (values parsed as JSON when possible)
   claude-threads pin <target> [--label TEXT]      pin; label defaults to Claude's task summary
   claude-threads unpin <target> | toggle-pin <target>
-  claude-threads pinned --rows [closed]           pinned threads as fzf rows (tmux-windowizer)
   claude-threads open <target> [--session NAME]   jump to the thread's window, or resume it in a new one in the tmux
                                                   session it was last in (recreated if gone; --session overrides)
   claude-threads snooze <target> [when...]        30m 2h 1h30m 3d 1w 45 | 14:30 9am | tomorrow [8am] | mon [10am]
@@ -522,27 +521,6 @@ def command_toggle_pin(arguments):
         command_pin(arguments[:1])
 
 
-def pinned_rows(only_closed=False):
-    rows = []
-    for thread in sorted((thread for thread in all_threads() if thread.get("pinned")), key=lambda thread: thread.get("pinned_at") or 0):
-        session_id = thread["session_id"]
-        is_live = live_window_of(session_id, thread) is not None
-        if only_closed and is_live:
-            continue
-        marker = AMBER + "^" + RESET if is_live else DIM + "↺" + RESET
-        snooze_mark = f" zzz {format_clock(thread['snoozed_until'])}" if (thread.get("snoozed_until") or 0) > now_epoch() else ""
-        rows.append(f"thread:{session_id}\t{marker} {thread_title(thread)}  {DIM}{shorten_home(thread.get('cwd'))}  "
-                    f"{thread.get('git_branch') or ''}{snooze_mark}{RESET}")
-    return rows
-
-
-def command_pinned(arguments):
-    if arguments[:1] != ["--rows"]:
-        raise CommandError("the pinned picker is now the inbox's pinned view (<prefix>i, then tab)")
-    for row in pinned_rows(only_closed=arguments[1:2] == ["closed"]):
-        print(row)
-
-
 def resume_launch(session_id, thread):
     """(launch directory, shell command) that resumes the thread with its original flags; falls back to a shell."""
     transcript_path = thread.get("transcript_path")
@@ -589,6 +567,24 @@ def new_window_in_session(session_name, launch_directory, shell_command=None, wi
     return tmux(*creation, *name_arguments, "-c", launch_directory, *command_arguments)
 
 
+AUTOMATIC_WINDOW_NAME_PATTERN = re.compile(r"^(claude|node|zsh|bash|sh|fish|login|nvim|vim|\d+(\.\d+)+)$|\[(tmux|dead)\]")
+
+
+def reopen_window_name(thread):
+    """Name for a reopened thread's window, or None to leave tmux's automatic renaming on (like a fresh window).
+    A name you gave the window comes back; an automatic one (claude, zsh, ...) isn't pinned down. The pin label
+    is only used when no window name was ever recorded. Threads recorded before the hook stored window_named
+    are judged by the name itself."""
+    window_name = thread.get("window_name") or ""
+    if window_name:
+        window_was_named = thread.get("window_named")
+        if window_was_named is None:
+            window_was_named = not AUTOMATIC_WINDOW_NAME_PATTERN.search(window_name)
+        return window_name[:40] if window_was_named else None
+    pin_label = thread.get("pin_label") if thread.get("pinned") else None
+    return pin_label[:40] if pin_label else None
+
+
 def command_open(arguments):
     if not arguments:
         raise CommandError("usage: claude-threads open <target> [--session NAME]")
@@ -602,9 +598,8 @@ def command_open(arguments):
         tmux("switch-client", "-t", live_window)
         return
     launch_directory, resume_command = resume_launch(session_id, thread)
-    window_title = (thread.get("pin_label") or thread.get("window_name") or "claude")[:40]
     target_session = requested_session or thread.get("tmux_session_name")
-    new_window_id = new_window_in_session(target_session, launch_directory, resume_command, window_title)
+    new_window_id = new_window_in_session(target_session, launch_directory, resume_command, reopen_window_name(thread))
     if not new_window_id:
         raise CommandError(f"couldn't open a window in tmux session {target_session or '(current)'}")
     attach_thread_to_window(session_id, thread, new_window_id)
@@ -1441,7 +1436,7 @@ def open_or_explain(target):
 
 COMMANDS = {
     "list": command_list, "show": command_show, "set": command_set,
-    "pin": command_pin, "unpin": command_unpin, "toggle-pin": command_toggle_pin, "pinned": command_pinned,
+    "pin": command_pin, "unpin": command_unpin, "toggle-pin": command_toggle_pin,
     "open": command_open, "snooze-prompt": command_snooze_prompt,
     "snooze": command_snooze, "wake": command_wake, "wake-due": command_wake_due,
     "settle": command_settle, "unsettle": command_unsettle, "sweep": command_sweep, "inbox": command_inbox,
