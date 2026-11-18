@@ -1455,10 +1455,22 @@ def approval_breaks_snooze(thread):
     return thread.get("outcome") == "needs_approval" and thread.get("live_state") == "waiting"
 
 
-def inbox_selection(view):
-    """(threads in the view's order, number of snoozed threads hidden from the inbox view)."""
+def parked_job_parents(live_sessions=None):
+    """Background job session id -> session id of the live interactive session that parked it (its parkedJobId).
+    A parked job carries on that session's conversation, so the inbox folds it into the parent's row."""
+    live_sessions = live_claude_processes() if live_sessions is None else live_sessions
+    job_session_ids = {info["jobId"]: session_id for session_id, info in live_sessions.items()
+                       if info.get("kind") == "bg" and info.get("jobId")}
+    return {job_session_ids[info["parkedJobId"]]: session_id for session_id, info in live_sessions.items()
+            if info.get("kind", "interactive") == "interactive" and info.get("parkedJobId") in job_session_ids}
+
+
+def inbox_selection(view, job_parents=None):
+    """(threads in the view's order, number of snoozed threads hidden from the inbox view).
+    Parked background jobs are left out; their parent's row stands for them."""
     current_time = now_epoch()
-    threads = [thread for thread in all_threads() if thread.get("session_id")]
+    job_parents = parked_job_parents() if job_parents is None else job_parents
+    threads = [thread for thread in all_threads() if thread.get("session_id") and thread["session_id"] not in job_parents]
     if view == "pinned":   # every pin, settled or snoozed included, in the order you pinned them
         return sorted((thread for thread in threads if thread.get("pinned")), key=lambda thread: thread.get("pinned_at") or 0), 0
     if view == "snoozed":
@@ -1504,8 +1516,10 @@ def live_window_locations():
 def inbox_rows(view):
     current_time = now_epoch()
     window_locations = live_window_locations()
+    job_parents = parked_job_parents()
+    parked_job_of = {parent_session_id: job_session_id for job_session_id, parent_session_id in job_parents.items()}
     rows = []
-    for thread in inbox_selection(view)[0]:
+    for thread in inbox_selection(view, job_parents)[0]:
         session_id = thread["session_id"]
         pin_mark = AMBER + "^" + RESET if thread.get("pinned") else " "
         status_glyph = INBOX_STATUS_GLYPH[inbox_status(thread)]
@@ -1538,6 +1552,9 @@ def inbox_rows(view):
             where = "live, no tmux window"
         else:
             where = "↺ closed"
+        if session_id in parked_job_of:
+            job_location = window_locations.get(parked_job_of[session_id], ("",))[0]
+            where += f"  + job{' in ' + job_location if job_location else ' in the background'}"
         rows.append(f"thread:{session_id}\t{pin_mark}{status_glyph} {format_age(thread.get('last_activity_at')):>4}  {tag}"
                     f"{name}  {DIM}{where}  {shorten_home(thread.get('cwd'))}  {thread.get('git_branch') or ''}{RESET}")
     return rows
