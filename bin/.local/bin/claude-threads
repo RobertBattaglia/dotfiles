@@ -397,33 +397,76 @@ def command_list(arguments):
               f"{(thread.get('live_state') or '?'):<7}  {DIM}{shorten_home(thread.get('cwd')):<40}{RESET}  {thread_title(thread)}")
 
 
-def recent_prompts(transcript_path, limit=5):
-    """Last few user-typed prompts from a transcript's tail (local preview only)."""
-    prompts = []
+def transcript_tail_entries(transcript_path, max_bytes=4 * TRANSCRIPT_CHUNK_BYTES):
+    """Parsed entries from the last max_bytes of a transcript, oldest first ([] if unreadable)."""
     try:
         with open(transcript_path, "rb") as transcript:
             transcript.seek(0, os.SEEK_END)
             size = transcript.tell()
-            transcript.seek(max(0, size - 4 * TRANSCRIPT_CHUNK_BYTES))
-            lines = transcript.read().splitlines()[1 if size > 4 * TRANSCRIPT_CHUNK_BYTES else 0:]
+            transcript.seek(max(0, size - max_bytes))
+            blob = transcript.read()
     except OSError:
-        return prompts
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
-            continue
-        content = (entry.get("message") or {}).get("content")
-        if isinstance(content, list):
-            content = " ".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
-        if not isinstance(content, str) or not content.strip() or content.lstrip().startswith("<"):
-            continue
-        prompts.append(" ".join(content.split())[:200])
-        if len(prompts) >= limit:
-            break
-    return list(reversed(prompts))
+        return []
+    return [entry for entry in parse_json_lines(blob, size > max_bytes) if isinstance(entry, dict)]
+
+
+def typed_prompt_text(entry):
+    """The text you typed, for a top-level user prompt entry; None for tool results, commands, meta entries."""
+    if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
+        return None
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = " ".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
+    if not isinstance(content, str) or not content.strip() or content.lstrip().startswith("<"):
+        return None
+    return " ".join(content.split())
+
+
+def recent_prompts(entries, limit=5):
+    """Last few user-typed prompts (local preview only)."""
+    prompts = [prompt[:200] for prompt in map(typed_prompt_text, entries) if prompt]
+    return prompts[-limit:]
+
+
+# Footers Claude Code appends to a recap: "(disable / turn off recaps in /config)" and a date line ("2026-11-18",
+# sometimes in *italics*), in either order.
+RECAP_FOOTER_PATTERN = re.compile(r"(\s*\([^()]*recaps in /config\)|\s*\n\s*\*?\d{4}-\d{2}-\d{2}\*?)\s*$")
+
+
+def strip_recap_footers(text):
+    while True:
+        stripped_text = RECAP_FOOTER_PATTERN.sub("", text)
+        if stripped_text == text:
+            return text
+        text = stripped_text
+
+
+def recap_text(entry):
+    """Text of a session recap entry: Claude Code's automatic one (system/away_summary) or /recap's output."""
+    if entry.get("type") != "system" or entry.get("isSidechain"):
+        return None
+    content = entry.get("content")
+    if not isinstance(content, str):
+        return None
+    if entry.get("subtype") == "away_summary":
+        text = content
+    elif entry.get("subtype") == "local_command" and (entry.get("commandRun") or {}).get("command") == "recap":
+        text = re.sub(r"</?local-command-stdout>", "", content)
+    else:
+        return None
+    return strip_recap_footers(text.strip()).strip() or None
+
+
+def latest_recap(entries):
+    """(recap text, its epoch time, prompts you typed after it) for the newest recap, or None."""
+    prompts_after = 0
+    for entry in reversed(entries):
+        text = recap_text(entry)
+        if text:
+            return text, iso_to_epoch(entry.get("timestamp")), prompts_after
+        if typed_prompt_text(entry):
+            prompts_after += 1
+    return None
 
 
 def command_show(arguments):
@@ -449,7 +492,16 @@ def command_show(arguments):
     if transcript_path and not os.path.exists(transcript_path):
         print(f"  {RED}transcript deleted; not resumable{RESET}")
     elif transcript_path:
-        prompts = recent_prompts(transcript_path)
+        entries = transcript_tail_entries(transcript_path)
+        recap = latest_recap(entries)
+        if recap:
+            text, recap_time, prompts_after = recap
+            age = format_age(recap_time) if recap_time else None
+            when = ("just now" if age == "now" else f"{age} ago") if age else ""
+            since = f", {prompts_after} prompt{'s' if prompts_after != 1 else ''} since" if prompts_after else ""
+            print(f"\nRecap{f' ({when}{since})' if when or since else ''}:")
+            print(f"  {text}")
+        prompts = recent_prompts(entries)
         if prompts:
             print("\nRecent prompts:")
             for prompt in prompts:
