@@ -62,10 +62,18 @@ if [[ -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]]; then
   trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 fi
 
+# Background jobs (kind "bg" in ~/.claude/sessions) run in Claude's daemon with no pane of their own; you watch them
+# through `claude attach` in some window. Mirror into the window that claims the session (claude-threads open sets
+# @claude_session_id there). One tmux call, only for pane-less sessions.
+if [[ -z "${TMUX_PANE:-}" && -n "$session_id" && "$session_id" =~ ^[A-Za-z0-9-]+$ ]] && command -v tmux >/dev/null; then
+  TMUX_PANE=$(tmux list-panes -a -F '#{pane_id} #{@claude_session_id}' 2>/dev/null \
+    | awk -v s="$session_id" '$2 == s {print $1; exit}')
+fi
+
 was_running=0 is_watched=0 automatic_rename=0 window_name="" pane_title="" pending_approval_tool=""
 window_id="" window_is_settled=0 window_is_snoozed=0 tmux_session_name=""
 if [[ -n "${TMUX_PANE:-}" ]]; then
-  # Pane titles are dropped when they are the shell's default "user@host:dir".
+  # Pane titles are dropped when they are the shell's default "user@host:dir" or tmux's default, the host name.
   {
     IFS= read -r was_running; IFS= read -r is_watched; IFS= read -r automatic_rename
     IFS= read -r window_name; IFS= read -r pane_title; IFS= read -r pending_approval_tool
@@ -73,7 +81,7 @@ if [[ -n "${TMUX_PANE:-}" ]]; then
     IFS= read -r tmux_session_name
   } < <(tmux display -p -t "$TMUX_PANE" "$(printf '%s\n' \
       '#{?@claude_running,1,0}' '#{&&:#{window_active},#{session_attached}}' '#{automatic-rename}' \
-      '#{window_name}' '#{?#{m:*@#{host_short}:*,#{pane_title}},,#{pane_title}}' '#{@claude_pending_approval_tool}' \
+      '#{window_name}' '#{?#{||:#{m:*@#{host_short}:*,#{pane_title}},#{||:#{==:#{pane_title},#{host}},#{==:#{pane_title},#{host_short}}}},,#{pane_title}}' '#{@claude_pending_approval_tool}' \
       '#{window_id}' '#{?@claude_settled,1,0}' '#{?@claude_snoozed,1,0}' '#{session_name}')" 2>/dev/null)
 fi
 

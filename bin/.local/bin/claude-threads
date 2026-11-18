@@ -50,6 +50,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import termios
@@ -231,7 +232,8 @@ def all_threads():
 
 
 def live_claude_processes():
-    """sessionId -> info from ~/.claude/sessions/<pid>.json for interactive Claude processes still alive."""
+    """sessionId -> info from ~/.claude/sessions/<pid>.json for Claude processes still alive: interactive ones and
+    background jobs (kind "bg", run by Claude's daemon and watched with `claude attach`)."""
     live_sessions = {}
     for session_file in glob.glob(os.path.join(CLAUDE_SESSIONS_DIR, "*.json")):
         try:
@@ -242,7 +244,7 @@ def live_claude_processes():
             pass
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if info.get("kind", "interactive") == "interactive" and info.get("sessionId"):
+        if info.get("kind", "interactive") in ("interactive", "bg") and info.get("sessionId"):
             live_sessions[info["sessionId"]] = info
     return live_sessions
 
@@ -298,28 +300,38 @@ def live_window_of(session_id, thread=None):
     return None
 
 
+def windows_holding_session(session_id):
+    """Every tmux window whose @claude_session_id is this session (more than one if it was resumed twice)."""
+    window_listing = tmux("list-windows", "-a", "-F", "#{window_id}\t#{@claude_session_id}") or ""
+    return [window_id for window_id, _, window_session_id in (line.partition("\t") for line in window_listing.splitlines())
+            if window_session_id == session_id]
+
+
 def mirror_to_window(session_id, thread=None, window_id=None):
-    """Push pin / snooze / settle markers from the registry onto the thread's live window."""
+    """Push pin / snooze / settle markers from the registry onto every live window holding the thread."""
     thread = thread or load_thread(session_id) or {}
-    window_id = window_id or live_window_of(session_id, thread)
-    if not window_id:
+    window_ids = windows_holding_session(session_id)
+    if window_id and window_id not in window_ids:
+        window_ids.append(window_id)
+    if not window_ids:
         return
-    commands = []
-
-    def set_option(option_name, option_value):
-        if option_value in (None, "", False):
-            commands.extend(["set", "-wu", "-t", window_id, option_name, ";"])
-        else:
-            commands.extend(["set", "-w", "-t", window_id, option_name, str(option_value), ";"])
-
     snoozed_until = thread.get("snoozed_until") or 0
     is_snoozed = snoozed_until > now_epoch()
-    set_option("@claude_session_id", session_id)
-    set_option("@claude_pinned", "1" if thread.get("pinned") else "")
-    set_option("@claude_snoozed", "1" if is_snoozed else "")
-    set_option("@claude_snoozed_label", format_clock(snoozed_until) if is_snoozed else "")
-    set_option("@claude_snooze_news", "1" if is_snoozed and thread.get("snooze_news") else "")
-    set_option("@claude_settled", "1" if thread.get("settled") else "")
+    option_values = {
+        "@claude_session_id": session_id,
+        "@claude_pinned": "1" if thread.get("pinned") else "",
+        "@claude_snoozed": "1" if is_snoozed else "",
+        "@claude_snoozed_label": format_clock(snoozed_until) if is_snoozed else "",
+        "@claude_snooze_news": "1" if is_snoozed and thread.get("snooze_news") else "",
+        "@claude_settled": "1" if thread.get("settled") else "",
+    }
+    commands = []
+    for target_window_id in window_ids:
+        for option_name, option_value in option_values.items():
+            if option_value:
+                commands.extend(["set", "-w", "-t", target_window_id, option_name, option_value, ";"])
+            else:
+                commands.extend(["set", "-wu", "-t", target_window_id, option_name, ";"])
     tmux(*commands[:-1])
 
 
@@ -346,8 +358,26 @@ def thread_marks(thread):
     return marks
 
 
+HOST_NAMES = {name.lower() for name in (socket.gethostname(), socket.gethostname().split(".")[0]) if name}
+SHELL_DEFAULT_TITLE_PATTERN = re.compile(r"^\S+@\S+:")   # "user@host:~/dir", what shells put in the title
+VERSION_TITLE_PATTERN = re.compile(r"^v?\d+(\.\d+)+$")      # tmux auto-names a Claude window after its version
+# Claude's title before it has summarized the task, and what tmux auto-names a window after its process.
+GENERIC_TITLES = {"claude", "claude code", "zsh", "bash", "sh", "fish", "node"}
+
+
+def is_useful_title(text):
+    """False for placeholder titles: the host name or user@host:dir (tmux / shell defaults), a bare "Claude Code",
+    or a process name."""
+    text = (text or "").strip()
+    return (bool(text) and text.lower() not in HOST_NAMES | GENERIC_TITLES
+            and not SHELL_DEFAULT_TITLE_PATTERN.match(text) and not VERSION_TITLE_PATTERN.match(text))
+
+
 def thread_title(thread):
-    return thread.get("pin_label") or thread.get("pane_title") or thread.get("title") or thread.get("window_name") or "(untitled)"
+    for candidate in (thread.get("pin_label"), thread.get("pane_title"), thread.get("title"), thread.get("window_name")):
+        if is_useful_title(candidate):
+            return candidate
+    return "(untitled)"
 
 
 def sort_key(thread):
@@ -493,9 +523,9 @@ def command_pin(arguments):
     window_id = window_id or live_window_of(session_id)
     pane_title = window_name = None
     if window_id:
-        # tmux's default pane title is the host name; only a title Claude (or you) set is a useful label
-        pane_title = re.sub(r"^[^A-Za-z0-9]+", "", tmux("display", "-p", "-t", window_id,
-                            "#{?#{||:#{==:#{pane_title},#{host}},#{==:#{pane_title},#{host_short}}},,#{pane_title}}") or "")
+        # only a title Claude (or you) set is a useful label, not tmux's / the shell's default
+        pane_title = re.sub(r"^[^A-Za-z0-9]+", "", tmux("display", "-p", "-t", window_id, "#{pane_title}") or "")
+        pane_title = pane_title if is_useful_title(pane_title) else None
         window_name = tmux("display", "-p", "-t", window_id, "#{window_name}")
     resume_flags = resume_flags_for_session(session_id)
     process_cwd = (live_claude_processes().get(session_id) or {}).get("cwd")
@@ -503,7 +533,8 @@ def command_pin(arguments):
     def apply_pin(thread):
         thread["pinned"] = True
         thread["pinned_at"] = thread.get("pinned_at") or now_epoch()
-        thread["pin_label"] = label or thread.get("pin_label") or pane_title or thread.get("pane_title") or thread.get("title") or window_name
+        stored_label = thread.get("pin_label") if is_useful_title(thread.get("pin_label")) else None
+        thread["pin_label"] = label or stored_label or pane_title or thread_title(dict(thread, pin_label=None, window_name=window_name))
         if window_id:
             thread.setdefault("tmux_window_id", window_id)
         if resume_flags is not None:
@@ -1276,10 +1307,14 @@ def plan_restore(snapshot_windows, claude_only):
     open_windows = set()
     for line in (tmux("list-windows", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_current_path}") or "").splitlines():
         open_windows.add(tuple(line.split("\t")))
-    plan, skipped = {}, []
+    plan, skipped, planned_session_ids = {}, [], set()
     for window in snapshot_windows:
         session_id = window["claude_session_id"]
         window_label = f"{window['session_name']}:{window['window_index']} {window['window_name']}"
+        if session_id in planned_session_ids:
+            # Two windows on one session (resumed twice) would be two Claude processes writing one transcript.
+            skipped.append(f"{window_label} (duplicate of a window already restored)")
+            continue
         if session_id:
             thread = load_thread(session_id)
             if not thread:
@@ -1296,6 +1331,7 @@ def plan_restore(snapshot_windows, claude_only):
                 skipped.append(f"{window_label} (transcript deleted)")
                 continue
             plan.setdefault(window["session_name"], []).append(dict(window, kind="claude", thread=thread))
+            planned_session_ids.add(session_id)
         elif not claude_only:
             if (window["session_name"], window["window_name"], window["pane_current_path"]) in open_windows:
                 continue
@@ -1444,13 +1480,24 @@ def inbox_selection(view):
 
 
 def live_window_locations():
-    """Claude session id -> ("session:index", window name) for every tmux window that holds a thread (one tmux call)."""
-    window_listing = tmux("list-windows", "-a", "-F", "#{@claude_session_id}\t#{session_name}:#{window_index}\t#{window_name}") or ""
-    locations = {}
+    """Claude session id -> ("session:index", window name) for every tmux window that holds a thread (one tmux call).
+    The name is "" while tmux is still auto-naming the window after its process (claude, zsh, ...).
+    The location gets a "+N windows" suffix when the session is open in several windows (resumed more than once)."""
+    window_listing = tmux("list-windows", "-a", "-F",
+                          "#{@claude_session_id}\t#{session_name}:#{window_index}\t#{?automatic-rename,,#{window_name}}") or ""
+    locations, extra_window_counts = {}, {}
     for line in window_listing.splitlines():
         session_id, location, window_name = (line.split("\t") + ["", ""])[:3]
-        if session_id:
+        if not session_id:
+            continue
+        if session_id in locations:
+            extra_window_counts[session_id] = extra_window_counts.get(session_id, 0) + 1
+        else:
             locations[session_id] = (location, window_name)
+    for session_id, extra_window_count in extra_window_counts.items():
+        location, window_name = locations[session_id]
+        locations[session_id] = (f"{location}{RESET} {RED}+{extra_window_count} more window{'s' if extra_window_count > 1 else ''}{RESET}{DIM}",
+                                 window_name)
     return locations
 
 
@@ -1473,21 +1520,26 @@ def inbox_rows(view):
             tag = f"{GRAY}zzz {format_clock(thread['snoozed_until'])}{RESET}  "
         else:
             tag = ""
-        location, live_window_name = window_locations.get(session_id, (None, None))
-        window_name = live_window_name or thread.get("window_name") or ""
-        if window_name == thread_title(thread):
-            window_name = ""   # don't repeat the title
-        window_mark = f"{RESET}[{window_name}]{DIM} " if window_name else ""
+        location, live_window_name = window_locations.get(session_id, (None, ""))
         if location:
-            where = f"{window_mark}{location}"
-        elif thread.get("transcript_missing"):
-            where = f"{window_mark}{RED}gone (not resumable){RESET}{DIM}"
-        elif thread.get("live_state") != "closed":
-            where = f"{window_mark}live, no tmux window"
+            window_name = live_window_name
+        else:   # closed: the last name recorded, unless tmux was auto-naming it then
+            window_name = thread.get("window_name") if thread.get("window_named") is not False else ""
+        title = thread_title(thread)
+        if not is_useful_title(window_name) or title.startswith(window_name):
+            name = title   # nothing to add, or it would repeat the title (window names get truncated)
         else:
-            where = f"{window_mark}↺ closed"
+            name = f"{window_name} [{title}]"   # the tmux window name you know it by, then Claude's title
+        if location:
+            where = location
+        elif thread.get("transcript_missing"):
+            where = f"{RED}gone (not resumable){RESET}{DIM}"
+        elif thread.get("live_state") != "closed":
+            where = "live, no tmux window"
+        else:
+            where = "↺ closed"
         rows.append(f"thread:{session_id}\t{pin_mark}{status_glyph} {format_age(thread.get('last_activity_at')):>4}  {tag}"
-                    f"{thread_title(thread)}  {DIM}{where}  {shorten_home(thread.get('cwd'))}  {thread.get('git_branch') or ''}{RESET}")
+                    f"{name}  {DIM}{where}  {shorten_home(thread.get('cwd'))}  {thread.get('git_branch') or ''}{RESET}")
     return rows
 
 
