@@ -1669,15 +1669,26 @@ def inbox_delete_key(target):
 
 
 MINIMUM_FZF_VERSION = (0, 65)   # --footer / transform-footer
+FZF_INSTALL_DIRECTORY_BINARY = os.path.expanduser("~/.fzf/bin/fzf")   # where github.com/junegunn/fzf's installer puts it
+
+
+def fzf_command():
+    """fzf from PATH, else the upstream installer's ~/.fzf/bin/fzf. Popups get the tmux server's PATH, which is
+    fixed when the server starts and can lack directories your shell adds later."""
+    return shutil.which("fzf") or (FZF_INSTALL_DIRECTORY_BINARY if os.access(FZF_INSTALL_DIRECTORY_BINARY, os.X_OK) else None)
 
 
 def fzf_version_problem():
     """Why the installed fzf can't run the inbox, or None."""
+    fzf_path = fzf_command()
+    if not fzf_path:
+        return (f"fzf is not on this PATH ({os.environ.get('PATH', '')}). tmux popups use the tmux server's PATH: "
+                f"run  tmux set-environment -g PATH \"$PATH\"  from a shell where fzf works")
     try:
-        version_output = subprocess.run(["fzf", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        version_output = subprocess.run([fzf_path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                         text=True).stdout
-    except OSError:
-        return "fzf is not installed"
+    except OSError as error:
+        return f"can't run {fzf_path}: {error}"
     version_match = re.match(r"\s*(\d+)\.(\d+)", version_output)
     if version_match and tuple(map(int, version_match.groups())) >= MINIMUM_FZF_VERSION:
         return None
@@ -1734,7 +1745,7 @@ def command_inbox(arguments):
     rows = inbox_rows("inbox")
     reload_rows = "reload(claude-threads inbox --rows)"
     fzf = subprocess.run(
-        ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2", "--no-sort", "--layout=reverse",
+        [fzf_command(), "--ansi", "--delimiter=\t", "--with-nth=2", "--no-sort", "--layout=reverse",
          "--prompt", INBOX_VIEW_PROMPTS["inbox"], "--header", INBOX_VIEW_HEADERS["inbox"],
          "--footer", inbox_footer("inbox"),
          "--bind", "load:transform-footer(claude-threads inbox --footer)",
