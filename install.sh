@@ -63,6 +63,12 @@ for package in "${common_packages[@]}"; do
     install_package $package
 done
 
+# The Claude Code hooks (claude-tmux-state) can't read their hook JSON without jq, and fail silently
+if ! command -v jq &> /dev/null; then
+    echo "WARNING: jq is not installed; the Claude Code hooks (claude-tmux-state) will not work until it is." >&2
+    jq_missing=1
+fi
+
 # Install tmux-mem-cpu-load on Ubuntu
 if [[ $OS == "linux" ]]; then
     echo "Installing tmux-mem-cpu-load dependencies..."
@@ -141,3 +147,6 @@ gpg> trust
   (choose 5 = I trust ultimately)
 gpg> save
 "
+if [[ -n "$jq_missing" ]]; then
+    echo "4. Install jq (needed by the Claude Code hooks): it failed to install above"
+fi
