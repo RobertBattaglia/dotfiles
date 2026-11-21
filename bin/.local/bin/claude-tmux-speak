@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Speak a short announcement via macOS `say`, detached so callers (Claude hooks, claude-threads) return immediately.
-# say has no volume option, so render to a temp file and play it with afplay's per-sound volume.
+# Speak a short announcement, detached so callers (Claude hooks, claude-threads) return immediately.
+#   macOS: `say` has no volume option, so render to a temp file and play it with afplay's per-sound volume.
+#   Linux: speech-dispatcher's `spd-say` when `say` isn't available.
 #
 # Usage: claude-tmux-speak "<text>"
 #   CLAUDE_TMUX_SPEAK=0          mute
-#   CLAUDE_TMUX_SPEAK_VOLUME=0.6 afplay volume (1 = normal) without touching the system volume
+#   CLAUDE_TMUX_SPEAK_VOLUME=0.6 loudness without touching the system volume (1 = normal; spd-say maps it to -i)
 [[ "${CLAUDE_TMUX_SPEAK:-1}" == 1 && -n "${1:-}" ]] || exit 0
-command -v say >/dev/null 2>&1 || exit 0
-nohup bash -c '
-  # explicit XXXXXX template: works with BSD and GNU mktemp (Homebrew gnubin shadows BSD, and GNU rejects -t NAME)
-  temporary_base=$(mktemp "${TMPDIR:-/tmp}/claude-tmux-speak.XXXXXX") || exit 0
-  speech_file="$temporary_base.aiff"
-  say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
-  rm -f "$speech_file" "$temporary_base"
-' _ "$1" "${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}" >/dev/null 2>&1 &
+speech_volume=${CLAUDE_TMUX_SPEAK_VOLUME:-0.6}
+if command -v say >/dev/null 2>&1; then
+  nohup bash -c '
+    # explicit XXXXXX template: works with BSD and GNU mktemp (Homebrew gnubin shadows BSD, and GNU rejects -t NAME)
+    temporary_base=$(mktemp "${TMPDIR:-/tmp}/claude-tmux-speak.XXXXXX") || exit 0
+    speech_file="$temporary_base.aiff"
+    say -o "$speech_file" "$1" && afplay -v "$2" "$speech_file"
+    rm -f "$speech_file" "$temporary_base"
+  ' _ "$1" "$speech_volume" >/dev/null 2>&1 &
+elif command -v spd-say >/dev/null 2>&1; then
+  # spd-say -i takes -100..100 with 0 = normal, so volume 1 -> 0 and 0.6 -> -40
+  spd_volume=$(awk -v volume="$speech_volume" 'BEGIN { level = int((volume - 1) * 100); if (level < -100) level = -100; if (level > 100) level = 100; print level }')
+  nohup spd-say -i "$spd_volume" -- "$1" >/dev/null 2>&1 &
+fi
 exit 0

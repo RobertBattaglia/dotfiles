@@ -98,7 +98,7 @@ Located in `~/.local/bin`:
 | `claude-tmux-state` | Claude Code hook helper: records each session in the thread registry, tmux status colours, spoken alerts (see below) |
 | `claude-threads` | Claude thread registry CLI: pin, snooze, settle, reopen closed sessions, backfill/auto-settle sweep (`claude-threads --help`) |
 | `claude-threads-tick` | Status-bar timer that wakes expired snoozes (cheap; runs every `status-interval`) |
-| `claude-tmux-speak` | Detached `say`/`afplay` announcement helper shared by the above |
+| `claude-tmux-speak` | Detached announcement helper shared by the above: `say`/`afplay` on macOS, `spd-say` (speech-dispatcher) on Linux |
 
 ## ⌨️ Key Bindings
 
