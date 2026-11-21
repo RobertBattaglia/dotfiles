@@ -623,9 +623,10 @@ def resume_launch(session_id, thread):
     recovery_hint = ""
     if launch_directory != thread_cwd:
         notify(f"claude-threads: {thread_cwd} is missing; resuming from {launch_directory}")
-        recovery_hint = (f"echo {shlex.quote(f'claude-threads: {thread_cwd} is gone (removed worktree?). Recreate it, e.g. '
-                                             f'git worktree add {thread_cwd} {thread.get("git_branch") or "<branch>"}, '
-                                             f'then: cd {thread_cwd} && claude --resume {session_id}')}; ")
+        git_branch = thread.get("git_branch") or "<branch>"
+        recovery_message = (f"claude-threads: {thread_cwd} is gone (removed worktree?). Recreate it, e.g. "
+                            f"git worktree add {thread_cwd} {git_branch}, then: cd {thread_cwd} && claude --resume {session_id}")
+        recovery_hint = f"echo {shlex.quote(recovery_message)}; "
     resume_flags = thread.get("resume_flags") or ""
     resume_command = (f"{CLAUDE_COMMAND} {resume_flags + ' ' if resume_flags else ''}--resume {session_id} "
                       f"|| {{ {recovery_hint}true; }}; exec \"$SHELL\" -l")
@@ -1667,6 +1668,24 @@ def inbox_delete_key(target):
         read_keypress("Press any key ")
 
 
+MINIMUM_FZF_VERSION = (0, 65)   # --footer / transform-footer
+
+
+def fzf_version_problem():
+    """Why the installed fzf can't run the inbox, or None."""
+    try:
+        version_output = subprocess.run(["fzf", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        text=True).stdout
+    except OSError:
+        return "fzf is not installed"
+    version_match = re.match(r"\s*(\d+)\.(\d+)", version_output)
+    if version_match and tuple(map(int, version_match.groups())) >= MINIMUM_FZF_VERSION:
+        return None
+    found_version = version_output.split()[0] if version_output.strip() else "unknown"
+    return (f"fzf {found_version} is too old; the inbox needs {'.'.join(map(str, MINIMUM_FZF_VERSION))}+ "
+            f"(install.sh installs a current one from github.com/junegunn/fzf)")
+
+
 def command_inbox(arguments):
     view = current_inbox_view(arguments)
     target = arguments[1] if len(arguments) > 1 else ""
@@ -1705,6 +1724,9 @@ def command_inbox(arguments):
         inbox_delete_key(target)
         return
 
+    fzf_problem = fzf_version_problem()
+    if fzf_problem:
+        raise CommandError(fzf_problem)
     command_sweep(["--if-older-than", str(INBOX_SWEEP_MAX_AGE_SECONDS)])
     if not all_threads():
         notify("Inbox zero: no Claude threads yet")

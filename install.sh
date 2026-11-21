@@ -22,8 +22,15 @@ install_package() {
     if [[ $OS == "macos" ]]; then
         brew install $package_name
     else
+        # apt's fzf is too old for the claude-threads inbox (needs 0.65+): use the upstream binary
+        if [[ $package_name == "fzf" ]]; then
+            echo "Installing current fzf from github.com/junegunn/fzf..."
+            if [[ -d "$HOME/.fzf" ]]; then git -C "$HOME/.fzf" pull --ff-only; else git clone --depth 1 https://github.com/junegunn/fzf.git "$HOME/.fzf"; fi
+            "$HOME/.fzf/install" --bin
+            sudo mkdir -p /usr/local/bin   # on Ubuntu's default PATH ahead of /usr/bin, but may not exist yet
+            sudo ln -sf "$HOME/.fzf/bin/fzf" /usr/local/bin/fzf
         # Special handling for neovim on Ubuntu
-        if [[ $package_name == "neovim" ]]; then
+        elif [[ $package_name == "neovim" ]]; then
             echo "Installing Neovim stable version..."
             curl -fLO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
             sudo rm -rf /opt/nvim-linux-x86_64
@@ -43,6 +50,7 @@ common_packages=(
     "tmux"
     "neovim"
     "fzf"
+    "jq"
     "ripgrep"
     "gnupg"
     "htop"
