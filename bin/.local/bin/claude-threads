@@ -35,7 +35,7 @@ Usage:
   claude-threads inbox                            fzf over the registry (open, settle, snooze, pin); <prefix>i / W
                                                   views inbox / pinned / snoozed / settled, cycled with tab / shift-tab
                   [--rows [--view NAME] | --footer | --cycle next|previous | --settle-key T | --snooze-key T | --label-key T
-                   | --delete-key T | --delete-bind T]
+                   | --delete-key T | --settle-kill-key T | --ctrl-x-bind T]
 
 Environment / config ($STATE/claude-threads/config, KEY=VALUE lines; env wins):
   CLAUDE_THREADS_SETTLE_DAYS (SETTLE_DAYS)     auto-settle threads inactive this long (default 3)
@@ -911,8 +911,24 @@ def command_settle(arguments):
     should_confirm = "--confirm" in arguments
     positional_arguments = [argument for argument in arguments if argument not in ("--kill", "--confirm")]
     session_id, window_id = resolve_target(positional_arguments[0] if positional_arguments else "")
-    if should_confirm and not confirm_on_terminal(f"Settle '{thread_title(load_thread(session_id) or {})}'?"):
-        return
+    # --kill closes every window holding the session (it can be open in more than one), plus the one targeted.
+    windows_to_kill = []
+    if should_kill_window:
+        windows_to_kill = windows_holding_session(session_id)
+        if window_id and window_id not in windows_to_kill:
+            windows_to_kill.append(window_id)
+    if should_confirm:
+        existing_thread = load_thread(session_id) or {}
+        title = thread_title(existing_thread)
+        windows_phrase = "its window" if len(windows_to_kill) == 1 else f"its {len(windows_to_kill)} windows"
+        if existing_thread.get("settled"):   # e.g. a settled pin in the pinned view
+            if not windows_to_kill:
+                return   # already settled, nothing open: nothing to do
+            question = f"Close {windows_phrase} of '{title}'?"
+        else:
+            question = f"Settle '{title}' and close {windows_phrase}?" if windows_to_kill else f"Settle '{title}'?"
+        if not confirm_on_terminal(question):
+            return
 
     def apply_settle(thread):
         thread.update(settled=True, settled_at=thread.get("settled_at") or now_epoch(),
@@ -921,8 +937,9 @@ def command_settle(arguments):
     thread = update_thread(session_id, apply_settle)   # pins are kept: settling only leaves active views
     window_id = window_id or live_window_of(session_id, thread)
     recompute_next_wake()
-    if should_kill_window and window_id:
-        tmux("kill-window", "-t", window_id)
+    if windows_to_kill:
+        tmux(*[argument for target_window_id in windows_to_kill for argument in ("kill-window", "-t", target_window_id, ";")][:-1])
+        notify(f"Settled and closed: {thread_title(thread)}")
         return
     mirror_to_window(session_id, thread, window_id)
     notify(f"Settled: {thread_title(thread)}")
@@ -1472,11 +1489,11 @@ def restore_from_snapshot(arguments):
 # commands as $FZF_PROMPT.
 INBOX_VIEWS = ("inbox", "pinned", "snoozed", "settled")
 INBOX_VIEW_PROMPTS = {view: f"{view}> " for view in INBOX_VIEWS}
-INBOX_COMMON_KEYS = "enter: open/resume   ctrl-s: settle   ctrl-z: snooze   ctrl-t: pin/unpin"
+INBOX_COMMON_KEYS = "enter: open/resume   ctrl-s: settle   ctrl-x: settle + close window   ctrl-z: snooze   ctrl-t: pin/unpin"
 INBOX_VIEW_HEADERS = {
     "inbox": INBOX_COMMON_KEYS,
-    "pinned": "enter: open/resume   ctrl-s: settle/unsettle   ctrl-z: snooze   ctrl-t: unpin   ctrl-e: edit label",
-    "snoozed": "enter: open/resume   ctrl-s: settle   ctrl-z: new time or wake   ctrl-t: pin/unpin",
+    "pinned": "enter: open/resume   ctrl-s: settle/unsettle   ctrl-x: settle + close window   ctrl-z: snooze   ctrl-t: unpin   ctrl-e: edit label",
+    "snoozed": "enter: open/resume   ctrl-s: settle   ctrl-x: settle + close window   ctrl-z: new time or wake   ctrl-t: pin/unpin",
     "settled": "enter: open/resume   ctrl-s: unsettle   ctrl-z: snooze   ctrl-t: pin/unpin   ctrl-x: DELETE forever",
 }
 INBOX_SWEEP_MAX_AGE_SECONDS = 300
@@ -1725,11 +1742,16 @@ def command_inbox(arguments):
     if arguments[:1] == ["--label-key"] and target:
         inbox_label_key(target)
         return
-    if arguments[:1] == ["--delete-bind"]:
-        # ctrl-x does nothing outside the settled view. target is fzf's {1}, i.e. thread:<session_id>.
+    if arguments[:1] == ["--ctrl-x-bind"]:
+        # ctrl-x mirrors <prefix>X: settle and close the window (y/n). In the settled view, where everything is
+        # settled already, it deletes the thread forever (two confirmations). target is fzf's {1}: thread:<id>.
         session_id = target.removeprefix("thread:")
-        if view == "settled" and SESSION_ID_PATTERN.match(session_id):
-            print(f"execute(claude-threads inbox --delete-key thread:{session_id})+reload(claude-threads inbox --rows)")
+        if SESSION_ID_PATTERN.match(session_id):
+            key_action = "--delete-key" if view == "settled" else "--settle-kill-key"
+            print(f"execute(claude-threads inbox {key_action} thread:{session_id})+reload(claude-threads inbox --rows)")
+        return
+    if arguments[:1] == ["--settle-kill-key"] and target:
+        command_settle([target, "--kill", "--confirm"])
         return
     if arguments[:1] == ["--delete-key"] and target:
         inbox_delete_key(target)
@@ -1755,7 +1777,7 @@ def command_inbox(arguments):
          "--bind", f"ctrl-z:execute(claude-threads inbox --snooze-key {{1}})+{reload_rows}",
          "--bind", f"ctrl-t:execute-silent(claude-threads toggle-pin {{1}})+{reload_rows}",
          "--bind", f"ctrl-e:execute(claude-threads inbox --label-key {{1}})+{reload_rows}",
-         "--bind", "ctrl-x:transform(claude-threads inbox --delete-bind {1})",
+         "--bind", "ctrl-x:transform(claude-threads inbox --ctrl-x-bind {1})",
          "--wrap=word", "--bind", "ctrl-/:change-preview-window(down,45%|hidden|right,40%)",
          "--preview", "claude-threads show {1}", "--preview-window=right,40%,wrap"],
         input="\n".join(rows) + ("\n" if rows else ""), stdout=subprocess.PIPE, text=True)
